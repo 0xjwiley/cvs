@@ -1,17 +1,17 @@
 import unittest
 from unittest.mock import patch, MagicMock
-from cvs.lib.parallel.pssh import Pssh  # Test basic Pssh class directly
+from cvs.lib.parallel.phandle import ParallelHandle  # Test basic ParallelHandle class directly
 
 
-class TestPsshExec(unittest.TestCase):
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
+class TestParallelHandleExec(unittest.TestCase):
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
     def setUp(self, mock_pssh_client):
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         self.mock_pssh_client = mock_pssh_client
         self.host_list = ["host1", "host2"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
 
     def test_exec_successful(self):
         # Test: Execute command successfully on all hosts
@@ -29,7 +29,7 @@ class TestPsshExec(unittest.TestCase):
 
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
 
-        result = self.pssh.exec("echo hello")
+        result = self.handle.exec("echo hello")
 
         self.mock_client.run_command.assert_called_once_with("echo hello", stop_on_errors=True)
         self.assertIn("host1", result)
@@ -46,17 +46,17 @@ class TestPsshExec(unittest.TestCase):
 
         # With stop_on_errors=True, run_command raises on exception, no result returned
         with self.assertRaises(ConnectionError) as cm:
-            result = self.pssh.exec("echo hello")  # This should raise, so result is not assigned
+            result = self.handle.exec("echo hello")  # This should raise, so result is not assigned
 
         self.assertIn("Connection failed", str(cm.exception))
         # Since exception was raised, result was not returned
         self.assertNotIn("result", locals())
 
-    @patch.object(Pssh, "check_connectivity")
+    @patch.object(ParallelHandle, "check_connectivity")
     def test_exec_with_connection_error_stop_on_errors_false(self, mock_check_connectivity):
         # Test Case 2.2: Execute command with connection error and stop_on_errors=False
         # Exception should not be raised instead populated in output for failed hosts, success for others
-        self.pssh.stop_on_errors = False
+        self.handle.stop_on_errors = False
         from pssh.exceptions import ConnectionError
 
         mock_output1 = MagicMock()
@@ -75,7 +75,7 @@ class TestPsshExec(unittest.TestCase):
         self.mock_check_connectivity = mock_check_connectivity
         self.mock_check_connectivity.return_value = []  # No pruning
 
-        result = self.pssh.exec("echo hello", timeout=10)
+        result = self.handle.exec("echo hello", timeout=10)
 
         self.mock_client.run_command.assert_called_once_with("echo hello", read_timeout=10, stop_on_errors=False)
         self.assertIn("host1", result)
@@ -83,17 +83,17 @@ class TestPsshExec(unittest.TestCase):
         self.assertIn("success output", result["host1"])
         self.assertIn("Connection failed", result["host2"])
 
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
-    @patch.object(Pssh, "check_connectivity")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
+    @patch.object(ParallelHandle, "check_connectivity")
     def test_exec_with_pruning_unreachable_host(self, mock_check_connectivity, mock_pssh_client):
         # Test: With stop_on_errors=False,  on host2, and check_connectivity fails for host2, prune it
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         self.host_list = ["host1", "host2"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
-        self.pssh.stop_on_errors = False
-        self.pssh.check_connectivity = mock_check_connectivity
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle.stop_on_errors = False
+        self.handle.check_connectivity = mock_check_connectivity
         from pssh.exceptions import ConnectionError
 
         mock_output1 = MagicMock()
@@ -111,10 +111,10 @@ class TestPsshExec(unittest.TestCase):
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
         mock_check_connectivity.return_value = ["host2"]  # Simulate unreachable
 
-        result = self.pssh.exec("echo hello", timeout=10)
+        result = self.handle.exec("echo hello", timeout=10)
 
-        self.assertEqual(self.pssh.reachable_hosts, ["host1"])
-        self.assertEqual(self.pssh.unreachable_hosts, ["host2"])
+        self.assertEqual(self.handle.reachable_hosts, ["host1"])
+        self.assertEqual(self.handle.unreachable_hosts, ["host2"])
         self.assertIn("host1", result)
         self.assertIn("host2", result)
         self.assertIn("success output", result["host1"])
@@ -122,17 +122,17 @@ class TestPsshExec(unittest.TestCase):
         # Client should be recreated once (init + prune)
         self.assertEqual(mock_pssh_client.call_count, 2)
 
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
-    @patch.object(Pssh, "check_connectivity")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
+    @patch.object(ParallelHandle, "check_connectivity")
     def test_exec_no_pruning_when_reachable(self, mock_check_connectivity, mock_pssh_client):
         # Test: With stop_on_errors=False, timeout on host2, but check_connectivity succeeds, no pruning
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         self.host_list = ["host1", "host2"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
-        self.pssh.stop_on_errors = False
-        self.pssh.check_connectivity = mock_check_connectivity
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle.stop_on_errors = False
+        self.handle.check_connectivity = mock_check_connectivity
         from pssh.exceptions import Timeout
 
         mock_output1 = MagicMock()
@@ -150,10 +150,10 @@ class TestPsshExec(unittest.TestCase):
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
         mock_check_connectivity.return_value = []  # Always reachable
 
-        result = self.pssh.exec("echo hello", timeout=10)
+        result = self.handle.exec("echo hello", timeout=10)
 
-        self.assertEqual(self.pssh.reachable_hosts, ["host1", "host2"])  # No change
-        self.assertEqual(self.pssh.unreachable_hosts, [])
+        self.assertEqual(self.handle.reachable_hosts, ["host1", "host2"])  # No change
+        self.assertEqual(self.handle.unreachable_hosts, [])
         self.assertIn("host1", result)
         self.assertIn("host2", result)
         self.assertIn("success output", result["host1"])
@@ -161,17 +161,17 @@ class TestPsshExec(unittest.TestCase):
         # Client not recreated
         self.assertEqual(mock_pssh_client.call_count, 1)
 
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
-    @patch.object(Pssh, "check_connectivity")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
+    @patch.object(ParallelHandle, "check_connectivity")
     def test_exec_pruning_with_multiple_unreachable_hosts(self, mock_check_connectivity, mock_pssh_client):
         # Test: With stop_on_errors=False, multiple hosts (host2, host3) timeout and are unreachable, prune all
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         self.host_list = ["host1", "host2", "host3"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
-        self.pssh.stop_on_errors = False
-        self.pssh.check_connectivity = mock_check_connectivity
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle.stop_on_errors = False
+        self.handle.check_connectivity = mock_check_connectivity
         from pssh.exceptions import ConnectionError
 
         mock_output1 = MagicMock()
@@ -195,10 +195,10 @@ class TestPsshExec(unittest.TestCase):
         self.mock_client.run_command.return_value = [mock_output1, mock_output2, mock_output3]
         mock_check_connectivity.return_value = ["host2", "host3"]  # Simulate all unreachable
 
-        result = self.pssh.exec("echo hello", timeout=10)
+        result = self.handle.exec("echo hello", timeout=10)
 
-        self.assertEqual(self.pssh.reachable_hosts, ["host1"])
-        self.assertEqual(sorted(self.pssh.unreachable_hosts), ["host2", "host3"])
+        self.assertEqual(self.handle.reachable_hosts, ["host1"])
+        self.assertEqual(sorted(self.handle.unreachable_hosts), ["host2", "host3"])
         self.assertIn("host1", result)
         self.assertIn("host2", result)
         self.assertIn("host3", result)
@@ -208,16 +208,16 @@ class TestPsshExec(unittest.TestCase):
         # Client should be recreated once (init + prune)
         self.assertEqual(mock_pssh_client.call_count, 2)
 
-    @patch.object(Pssh, "check_connectivity")
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
+    @patch.object(ParallelHandle, "check_connectivity")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
     def test_exec_no_pruning_on_timeout_exception_reachable(self, mock_pssh_client, mock_check_connectivity):
         # Test: exec with timeout exception, no pruning if host is reachable
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         self.host_list = ["host1", "host2"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
-        self.pssh.stop_on_errors = False
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle.stop_on_errors = False
         from pssh.exceptions import Timeout
 
         mock_output1 = MagicMock()
@@ -235,10 +235,10 @@ class TestPsshExec(unittest.TestCase):
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
         mock_check_connectivity.return_value = []  # No pruning
 
-        result = self.pssh.exec("echo hello", timeout=10)
+        result = self.handle.exec("echo hello", timeout=10)
 
-        self.assertEqual(self.pssh.reachable_hosts, ["host1", "host2"])  # No pruning
-        self.assertEqual(self.pssh.unreachable_hosts, [])
+        self.assertEqual(self.handle.reachable_hosts, ["host1", "host2"])  # No pruning
+        self.assertEqual(self.handle.unreachable_hosts, [])
         self.assertIn("host1", result)
         self.assertIn("host2", result)
         self.assertIn("success output", result["host1"])
@@ -246,16 +246,16 @@ class TestPsshExec(unittest.TestCase):
         # Client not recreated
         self.assertEqual(mock_pssh_client.call_count, 1)
 
-    @patch.object(Pssh, "check_connectivity")
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
+    @patch.object(ParallelHandle, "check_connectivity")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
     def test_exec_pruning_on_timeout_exception_unreachable(self, mock_pssh_client, mock_check_connectivity):
         # Test: exec with timeout exception, pruning occurs if host unreachable
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         self.host_list = ["host1", "host2"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
-        self.pssh.stop_on_errors = False
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle.stop_on_errors = False
         from pssh.exceptions import Timeout
 
         mock_output1 = MagicMock()
@@ -273,10 +273,10 @@ class TestPsshExec(unittest.TestCase):
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
         mock_check_connectivity.return_value = ["host2"]  # Simulate unreachable
 
-        result = self.pssh.exec("echo hello", timeout=10)
+        result = self.handle.exec("echo hello", timeout=10)
 
-        self.assertEqual(self.pssh.reachable_hosts, ["host1"])
-        self.assertEqual(self.pssh.unreachable_hosts, ["host2"])
+        self.assertEqual(self.handle.reachable_hosts, ["host1"])
+        self.assertEqual(self.handle.unreachable_hosts, ["host2"])
         self.assertIn("host1", result)
         self.assertIn("host2", result)
         self.assertIn("success output", result["host1"])
@@ -286,8 +286,8 @@ class TestPsshExec(unittest.TestCase):
         # Client recreated after pruning
         self.assertEqual(mock_pssh_client.call_count, 2)
 
-    @patch.object(Pssh, "prune_unreachable_hosts")
-    @patch.object(Pssh, "inform_unreachability")
+    @patch.object(ParallelHandle, "prune_unreachable_hosts")
+    @patch.object(ParallelHandle, "inform_unreachability")
     def test_exec_no_pruning_when_stop_on_errors_true(self, mock_inform, mock_prune):
         # Test: With stop_on_errors=True, no pruning even with connection error
         # Since stop_on_errors=True, run_command raises immediately, so prune_unreachable_hosts and inform_unreachability are not invoked
@@ -296,14 +296,14 @@ class TestPsshExec(unittest.TestCase):
         self.mock_client.run_command.side_effect = ConnectionError("Connection failed")
 
         with self.assertRaises(ConnectionError):
-            self.pssh.exec("echo hello", timeout=10)
+            self.handle.exec("echo hello", timeout=10)
 
         # Assert that pruning methods were not called
         mock_prune.assert_not_called()
         mock_inform.assert_not_called()
 
-    @patch.object(Pssh, "prune_unreachable_hosts")
-    @patch.object(Pssh, "inform_unreachability")
+    @patch.object(ParallelHandle, "prune_unreachable_hosts")
+    @patch.object(ParallelHandle, "inform_unreachability")
     def test_exec_timeout_exception_when_stop_on_errors_true(self, mock_inform, mock_prune):
         # Test: With stop_on_errors=True, Timeout exception is re-raised
         from pssh.exceptions import Timeout
@@ -311,21 +311,21 @@ class TestPsshExec(unittest.TestCase):
         self.mock_client.run_command.side_effect = Timeout("Command timed out")
 
         with self.assertRaises(Timeout):
-            self.pssh.exec("echo hello", timeout=10)
+            self.handle.exec("echo hello", timeout=10)
 
         # Assert that pruning methods were not called
         mock_prune.assert_not_called()
         mock_inform.assert_not_called()
 
-    @patch.object(Pssh, "prune_unreachable_hosts")
-    @patch.object(Pssh, "inform_unreachability")
+    @patch.object(ParallelHandle, "prune_unreachable_hosts")
+    @patch.object(ParallelHandle, "inform_unreachability")
     def test_exec_stdout_timeout_during_iteration_stop_on_errors_false(self, mock_inform, mock_prune):
         # Regression: when Timeout is raised mid-stdout-iteration AND stop_on_errors=False,
         # _process_output must call _handle_timeout_exception (which got accidentally removed
         # in an earlier refactor). Without the helper restored, this raises AttributeError.
         from pssh.exceptions import Timeout
 
-        self.pssh.stop_on_errors = False
+        self.handle.stop_on_errors = False
 
         timeout_error = Timeout("Read timed out")
 
@@ -348,10 +348,10 @@ class TestPsshExec(unittest.TestCase):
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
 
         # Must NOT raise AttributeError (the bug we are guarding against).
-        # The Pssh code catches Timeout when stop_on_errors=False and routes through
+        # The ParallelHandle code catches Timeout when stop_on_errors=False and routes through
         # _handle_timeout_exception, which propagates the timeout to all items so the
         # subsequent item.exception handling block formats and records it.
-        result = self.pssh.exec("echo hello", timeout=10)
+        result = self.handle.exec("echo hello", timeout=10)
 
         # _handle_timeout_exception must populate item.exception on items that had None
         # so the subsequent formatting block records the timeout for both hosts.
@@ -377,7 +377,7 @@ class TestPsshExec(unittest.TestCase):
 
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
 
-        result = self.pssh.exec("echo hello", print_console=False)
+        result = self.handle.exec("echo hello", print_console=False)
 
         # Verify output is collected correctly
         self.assertIn("host1", result)
@@ -414,7 +414,7 @@ class TestPsshExec(unittest.TestCase):
 
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
 
-        result = self.pssh.exec("echo hello", detailed=True)
+        result = self.handle.exec("echo hello", detailed=True)
 
         self.assertIn("host1", result)
         self.assertIn("host2", result)
@@ -453,17 +453,17 @@ class TestPsshExec(unittest.TestCase):
 
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
 
-        result = self.pssh.exec("failing command", detailed=True)
+        result = self.handle.exec("failing command", detailed=True)
 
         self.assertEqual(result["host1"]["exit_code"], 0)
         self.assertEqual(result["host2"]["exit_code"], 1)
         self.assertIn("success output", result["host1"]["output"])
         self.assertIn("command failed", result["host2"]["output"])
 
-    @patch.object(Pssh, "check_connectivity")
+    @patch.object(ParallelHandle, "check_connectivity")
     def test_exec_detailed_true_with_exception(self, mock_check_connectivity):
         # Test: Execute command with exception and detailed=True
-        self.pssh.stop_on_errors = False
+        self.handle.stop_on_errors = False
         from pssh.exceptions import ConnectionError
 
         mock_output1 = MagicMock()
@@ -483,7 +483,7 @@ class TestPsshExec(unittest.TestCase):
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
         mock_check_connectivity.return_value = []  # No pruning
 
-        result = self.pssh.exec("echo hello", detailed=True)
+        result = self.handle.exec("echo hello", detailed=True)
 
         self.assertEqual(result["host1"]["exit_code"], 0)
         self.assertEqual(result["host2"]["exit_code"], -1)  # -1 for exceptions
@@ -511,7 +511,7 @@ class TestPsshExec(unittest.TestCase):
 
         self.mock_client.run_command.return_value = [mock_output]
 
-        result = self.pssh.exec("slow command", detailed=True)
+        result = self.handle.exec("slow command", detailed=True)
 
         # Must be -1 (the documented "unknown" sentinel), not None.
         self.assertEqual(result["host1"]["exit_code"], -1)
@@ -528,16 +528,16 @@ class TestPsshExec(unittest.TestCase):
 
         self.mock_client.run_command.return_value = [mock_output1]
 
-        result = self.pssh.exec("echo hello", detailed=False)
+        result = self.handle.exec("echo hello", detailed=False)
 
         # Should return string, not dict
         self.assertIsInstance(result["host1"], str)
         self.assertNotIsInstance(result["host1"], dict)
         self.assertIn("output1 line1", result["host1"])
 
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
     def test_init_does_not_alias_caller_host_list(self, mock_pssh_client):
-        # Regression (B2): Pssh.__init__ must not alias the caller's host_list.
+        # Regression (B2): ParallelHandle.__init__ must not alias the caller's host_list.
         # Before the fix, self.reachable_hosts and self.host_list both pointed to
         # the caller's list object, so prune_unreachable_hosts (which calls
         # self.reachable_hosts.remove(...)) silently mutated the caller's list.
@@ -546,26 +546,26 @@ class TestPsshExec(unittest.TestCase):
         # shrunk the orchestrator's view of the cluster.
         mock_pssh_client.return_value = MagicMock()
         original = ["a", "b", "c"]
-        pssh = Pssh(self.mock_log, original, user="user", password="pass")
+        handle = ParallelHandle(self.mock_log, original, user="user", password="pass")
         # Simulate what prune_unreachable_hosts does internally.
-        pssh.reachable_hosts.remove("b")
+        handle.reachable_hosts.remove("b")
         # (i) Caller's list must be untouched.
         self.assertEqual(original, ["a", "b", "c"])
         # (ii) Internal reachable view reflects the prune.
-        self.assertEqual(pssh.reachable_hosts, ["a", "c"])
+        self.assertEqual(handle.reachable_hosts, ["a", "c"])
         # (iii) host_list is a stable snapshot of the original input.
-        self.assertEqual(pssh.host_list, ["a", "b", "c"])
+        self.assertEqual(handle.host_list, ["a", "b", "c"])
 
 
-class TestPsshExecCmdList(unittest.TestCase):
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
+class TestParallelHandleExecCmdList(unittest.TestCase):
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
     def setUp(self, mock_pssh_client):
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         self.mock_pssh_client = mock_pssh_client
         self.host_list = ["host1", "host2"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
 
     def test_exec_cmd_list_successful(self):
         # Test: Execute different commands on different hosts successfully
@@ -584,7 +584,7 @@ class TestPsshExecCmdList(unittest.TestCase):
 
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
 
-        result = self.pssh.exec_cmd_list(cmd_list)
+        result = self.handle.exec_cmd_list(cmd_list)
 
         self.mock_client.run_command.assert_called_once_with("%s", host_args=cmd_list, stop_on_errors=True)
         self.assertIn("host1", result)
@@ -592,11 +592,11 @@ class TestPsshExecCmdList(unittest.TestCase):
         self.assertIn("host1", result["host1"])
         self.assertIn("host2", result["host2"])
 
-    @patch.object(Pssh, "check_connectivity")
+    @patch.object(ParallelHandle, "check_connectivity")
     def test_exec_cmd_list_with_connection_error_stop_on_errors_false(self, mock_check_connectivity):
         # Test: Handle exceptions with stop_on_errors=False for exec_cmd_list
         # Exception should not be raised instead populated in output for failed hosts, success for others
-        self.pssh.stop_on_errors = False
+        self.handle.stop_on_errors = False
         cmd_list = ["echo success", "echo fail"]
         from pssh.exceptions import ConnectionError
 
@@ -616,7 +616,7 @@ class TestPsshExecCmdList(unittest.TestCase):
         self.mock_check_connectivity = mock_check_connectivity
         self.mock_check_connectivity.return_value = []  # Simulate reachable, no pruning
 
-        result = self.pssh.exec_cmd_list(cmd_list, timeout=10)
+        result = self.handle.exec_cmd_list(cmd_list, timeout=10)
 
         self.mock_client.run_command.assert_called_once_with(
             "%s", host_args=cmd_list, read_timeout=10, stop_on_errors=False
@@ -635,22 +635,22 @@ class TestPsshExecCmdList(unittest.TestCase):
         self.mock_client.run_command.side_effect = ConnectionError("Connection failed")
 
         with self.assertRaises(ConnectionError) as cm:
-            result = self.pssh.exec_cmd_list(cmd_list, timeout=5)
+            result = self.handle.exec_cmd_list(cmd_list, timeout=5)
 
         self.assertIn("Connection failed", str(cm.exception))
         self.assertNotIn("result", locals())
 
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
-    @patch.object(Pssh, "check_connectivity")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
+    @patch.object(ParallelHandle, "check_connectivity")
     def test_exec_cmd_list_no_pruning_when_reachable(self, mock_check_connectivity, mock_pssh_client):
         # Test: exec_cmd_list with stop_on_errors=False, timeout on host2, but check_connectivity succeeds, no pruning
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         self.host_list = ["host1", "host2"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
-        self.pssh.stop_on_errors = False
-        self.pssh.check_connectivity = mock_check_connectivity
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle.stop_on_errors = False
+        self.handle.check_connectivity = mock_check_connectivity
         cmd_list = ["echo success", "echo fail"]
         from pssh.exceptions import Timeout
 
@@ -669,10 +669,10 @@ class TestPsshExecCmdList(unittest.TestCase):
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
         mock_check_connectivity.return_value = []  # Always reachable
 
-        result = self.pssh.exec_cmd_list(cmd_list, timeout=10)
+        result = self.handle.exec_cmd_list(cmd_list, timeout=10)
 
-        self.assertEqual(self.pssh.reachable_hosts, ["host1", "host2"])  # No change
-        self.assertEqual(self.pssh.unreachable_hosts, [])
+        self.assertEqual(self.handle.reachable_hosts, ["host1", "host2"])  # No change
+        self.assertEqual(self.handle.unreachable_hosts, [])
         self.assertIn("host1", result)
         self.assertIn("host2", result)
         self.assertIn("success", result["host1"])
@@ -680,17 +680,17 @@ class TestPsshExecCmdList(unittest.TestCase):
         # Client not recreated
         self.assertEqual(mock_pssh_client.call_count, 1)
 
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
-    @patch.object(Pssh, "check_connectivity")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
+    @patch.object(ParallelHandle, "check_connectivity")
     def test_exec_cmd_list_pruning_on_timeout_exception_unreachable(self, mock_check_connectivity, mock_pssh_client):
         # Test: exec_cmd_list with timeout exception, pruning occurs if host unreachable
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         self.host_list = ["host1", "host2"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
-        self.pssh.stop_on_errors = False
-        self.pssh.check_connectivity = mock_check_connectivity
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle.stop_on_errors = False
+        self.handle.check_connectivity = mock_check_connectivity
         cmd_list = ["echo success", "echo fail"]
         from pssh.exceptions import Timeout
 
@@ -709,10 +709,10 @@ class TestPsshExecCmdList(unittest.TestCase):
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
         mock_check_connectivity.return_value = ["host2"]  # Simulate unreachable
 
-        result = self.pssh.exec_cmd_list(cmd_list, timeout=10)
+        result = self.handle.exec_cmd_list(cmd_list, timeout=10)
 
-        self.assertEqual(self.pssh.reachable_hosts, ["host1"])
-        self.assertEqual(self.pssh.unreachable_hosts, ["host2"])
+        self.assertEqual(self.handle.reachable_hosts, ["host1"])
+        self.assertEqual(self.handle.unreachable_hosts, ["host2"])
         self.assertIn("host1", result)
         self.assertIn("host2", result)
         self.assertIn("success", result["host1"])
@@ -721,17 +721,17 @@ class TestPsshExecCmdList(unittest.TestCase):
         )
         self.assertEqual(mock_pssh_client.call_count, 2)
 
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
-    @patch.object(Pssh, "check_connectivity")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
+    @patch.object(ParallelHandle, "check_connectivity")
     def test_exec_cmd_list_with_pruning(self, mock_check_connectivity, mock_pssh_client):
         # Test: exec_cmd_list with pruning
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         self.host_list = ["host1", "host2"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
-        self.pssh.stop_on_errors = False
-        self.pssh.check_connectivity = mock_check_connectivity
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle.stop_on_errors = False
+        self.handle.check_connectivity = mock_check_connectivity
         cmd_list = ["echo success", "echo fail"]
         from pssh.exceptions import ConnectionError
 
@@ -750,27 +750,27 @@ class TestPsshExecCmdList(unittest.TestCase):
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
         mock_check_connectivity.return_value = ["host2"]
 
-        result = self.pssh.exec_cmd_list(cmd_list, timeout=10)
+        result = self.handle.exec_cmd_list(cmd_list, timeout=10)
 
-        self.assertEqual(self.pssh.reachable_hosts, ["host1"])
-        self.assertEqual(self.pssh.unreachable_hosts, ["host2"])
+        self.assertEqual(self.handle.reachable_hosts, ["host1"])
+        self.assertEqual(self.handle.unreachable_hosts, ["host2"])
         self.assertIn("host1", result)
         self.assertIn("host2", result)
         self.assertIn("success", result["host1"])
         self.assertEqual(result["host2"], "Connection failed\n\nABORT: Host Unreachable Error")
         self.assertEqual(mock_pssh_client.call_count, 2)
 
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
-    @patch.object(Pssh, "check_connectivity")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
+    @patch.object(ParallelHandle, "check_connectivity")
     def test_exec_cmd_list_pruning_with_multiple_unreachable_hosts(self, mock_check_connectivity, mock_pssh_client):
         # Test: exec_cmd_list with pruning for multiple unreachable hosts
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         self.host_list = ["host1", "host2", "host3"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
-        self.pssh.stop_on_errors = False
-        self.pssh.check_connectivity = mock_check_connectivity
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle.stop_on_errors = False
+        self.handle.check_connectivity = mock_check_connectivity
         cmd_list = ["echo success", "echo fail1", "echo fail2"]
         from pssh.exceptions import ConnectionError
 
@@ -795,10 +795,10 @@ class TestPsshExecCmdList(unittest.TestCase):
         self.mock_client.run_command.return_value = [mock_output1, mock_output2, mock_output3]
         mock_check_connectivity.return_value = ["host2", "host3"]
 
-        result = self.pssh.exec_cmd_list(cmd_list, timeout=10)
+        result = self.handle.exec_cmd_list(cmd_list, timeout=10)
 
-        self.assertEqual(self.pssh.reachable_hosts, ["host1"])
-        self.assertEqual(sorted(self.pssh.unreachable_hosts), ["host2", "host3"])
+        self.assertEqual(self.handle.reachable_hosts, ["host1"])
+        self.assertEqual(sorted(self.handle.unreachable_hosts), ["host2", "host3"])
         self.assertIn("host1", result)
         self.assertIn("host2", result)
         self.assertIn("host3", result)
@@ -807,8 +807,8 @@ class TestPsshExecCmdList(unittest.TestCase):
         self.assertEqual(result["host3"], "Connection failed\n\nABORT: Host Unreachable Error")
         self.assertEqual(mock_pssh_client.call_count, 2)
 
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
-    @patch.object(Pssh, "check_connectivity")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
+    @patch.object(ParallelHandle, "check_connectivity")
     def test_exec_cmd_list_no_pruning_on_connection_error_when_reachable(
         self, mock_check_connectivity, mock_pssh_client
     ):
@@ -818,9 +818,9 @@ class TestPsshExecCmdList(unittest.TestCase):
         mock_pssh_client.return_value = self.mock_client
         self.host_list = ["host1", "host2"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
-        self.pssh.stop_on_errors = False
-        self.pssh.check_connectivity = mock_check_connectivity
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle.stop_on_errors = False
+        self.handle.check_connectivity = mock_check_connectivity
         cmd_list = ["echo success", "echo fail"]
         from pssh.exceptions import ConnectionError
 
@@ -839,10 +839,10 @@ class TestPsshExecCmdList(unittest.TestCase):
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
         mock_check_connectivity.return_value = []  # Simulate reachable, no pruning
 
-        result = self.pssh.exec_cmd_list(cmd_list, timeout=10)
+        result = self.handle.exec_cmd_list(cmd_list, timeout=10)
 
-        self.assertEqual(self.pssh.reachable_hosts, ["host1", "host2"])  # No pruning
-        self.assertEqual(self.pssh.unreachable_hosts, [])
+        self.assertEqual(self.handle.reachable_hosts, ["host1", "host2"])  # No pruning
+        self.assertEqual(self.handle.unreachable_hosts, [])
         self.assertIn("host1", result)
         self.assertIn("host2", result)
         self.assertIn("success", result["host1"])
@@ -850,8 +850,8 @@ class TestPsshExecCmdList(unittest.TestCase):
         # Client not recreated
         self.assertEqual(mock_pssh_client.call_count, 1)
 
-    @patch.object(Pssh, "prune_unreachable_hosts")
-    @patch.object(Pssh, "inform_unreachability")
+    @patch.object(ParallelHandle, "prune_unreachable_hosts")
+    @patch.object(ParallelHandle, "inform_unreachability")
     def test_exec_cmd_list_no_pruning_when_stop_on_errors_true(self, mock_inform, mock_prune):
         # Test: exec_cmd_list with stop_on_errors=True, no pruning even with connection error
         # Since stop_on_errors=True, run_command raises immediately, so prune_unreachable_hosts and inform_unreachability are not invoked
@@ -861,14 +861,14 @@ class TestPsshExecCmdList(unittest.TestCase):
         self.mock_client.run_command.side_effect = ConnectionError("Connection failed")
 
         with self.assertRaises(ConnectionError):
-            self.pssh.exec_cmd_list(cmd_list, timeout=5)
+            self.handle.exec_cmd_list(cmd_list, timeout=5)
 
         # Assert that pruning methods were not called
         mock_prune.assert_not_called()
         mock_inform.assert_not_called()
 
-    @patch.object(Pssh, "prune_unreachable_hosts")
-    @patch.object(Pssh, "inform_unreachability")
+    @patch.object(ParallelHandle, "prune_unreachable_hosts")
+    @patch.object(ParallelHandle, "inform_unreachability")
     def test_exec_cmd_list_timeout_exception_when_stop_on_errors_true(self, mock_inform, mock_prune):
         # Test: exec_cmd_list with stop_on_errors=True, Timeout exception is re-raised
         cmd_list = ["echo test"]
@@ -877,7 +877,7 @@ class TestPsshExecCmdList(unittest.TestCase):
         self.mock_client.run_command.side_effect = Timeout("Command timed out")
 
         with self.assertRaises(Timeout):
-            self.pssh.exec_cmd_list(cmd_list, timeout=5)
+            self.handle.exec_cmd_list(cmd_list, timeout=5)
 
         # Assert that pruning methods were not called
         mock_prune.assert_not_called()
@@ -901,7 +901,7 @@ class TestPsshExecCmdList(unittest.TestCase):
 
         self.mock_client.run_command.return_value = [mock_output1, mock_output2]
 
-        result = self.pssh.exec_cmd_list(cmd_list, print_console=False)
+        result = self.handle.exec_cmd_list(cmd_list, print_console=False)
 
         # Verify output is collected correctly
         self.assertIn("host1", result)
@@ -921,7 +921,7 @@ class TestPsshExecCmdList(unittest.TestCase):
             self.assertNotIn("host2 output line1", call)
 
 
-class TestPsshFileTransfer(unittest.TestCase):
+class TestParallelHandleFileTransfer(unittest.TestCase):
     """
     Unit tests for upload_file / download_file / scp_file.
 
@@ -931,13 +931,13 @@ class TestPsshFileTransfer(unittest.TestCase):
     aggregation message format on partial/full failure.
     """
 
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
     def setUp(self, mock_pssh_client):
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         self.host_list = ["host1", "host2"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
 
     def _ok_greenlet(self):
         g = MagicMock()
@@ -955,7 +955,7 @@ class TestPsshFileTransfer(unittest.TestCase):
         # Both hosts succeed -> no exception, copy_file called with right args
         self.mock_client.copy_file.return_value = [self._ok_greenlet(), self._ok_greenlet()]
 
-        self.pssh.upload_file("/tmp/local.json", "/remote/dest.json")
+        self.handle.upload_file("/tmp/local.json", "/remote/dest.json")
 
         self.mock_client.copy_file.assert_called_once_with("/tmp/local.json", "/remote/dest.json", recurse=False)
         self.mock_client.pool.join.assert_called_once()
@@ -964,7 +964,7 @@ class TestPsshFileTransfer(unittest.TestCase):
         # recurse=True must be propagated to copy_file
         self.mock_client.copy_file.return_value = [self._ok_greenlet(), self._ok_greenlet()]
 
-        self.pssh.upload_file("/tmp/dir", "/remote/dir", recurse=True)
+        self.handle.upload_file("/tmp/dir", "/remote/dir", recurse=True)
 
         self.mock_client.copy_file.assert_called_once_with("/tmp/dir", "/remote/dir", recurse=True)
 
@@ -974,7 +974,7 @@ class TestPsshFileTransfer(unittest.TestCase):
         self.mock_client.copy_file.return_value = [self._ok_greenlet(), self._fail_greenlet(boom)]
 
         with self.assertRaises(IOError) as cm:
-            self.pssh.upload_file("/tmp/local.json", "/remote/dest.json")
+            self.handle.upload_file("/tmp/local.json", "/remote/dest.json")
 
         msg = str(cm.exception)
         self.assertIn("upload_file '/tmp/local.json' -> '/remote/dest.json'", msg)
@@ -990,7 +990,7 @@ class TestPsshFileTransfer(unittest.TestCase):
         ]
 
         with self.assertRaises(IOError) as cm:
-            self.pssh.upload_file("/tmp/local.json", "/remote/dest.json")
+            self.handle.upload_file("/tmp/local.json", "/remote/dest.json")
 
         self.assertIn("upload_file '/tmp/local.json' -> '/remote/dest.json'", str(cm.exception))
         self.assertIn("failed on 2/2 hosts", str(cm.exception))
@@ -1005,7 +1005,7 @@ class TestPsshFileTransfer(unittest.TestCase):
         ]
 
         with self.assertRaises(IOError) as cm:
-            self.pssh.upload_file("/tmp/local.json", "/remote/dest.json")
+            self.handle.upload_file("/tmp/local.json", "/remote/dest.json")
 
         self.assertIn("libssh2 channel closed", str(cm.exception))
 
@@ -1018,7 +1018,7 @@ class TestPsshFileTransfer(unittest.TestCase):
             self._ok_greenlet(),
         ]
 
-        result = self.pssh.download_file("/remote/file.json", "/tmp/local.json")
+        result = self.handle.download_file("/remote/file.json", "/tmp/local.json")
 
         self.assertEqual(
             result,
@@ -1036,7 +1036,7 @@ class TestPsshFileTransfer(unittest.TestCase):
             self._ok_greenlet(),
         ]
 
-        result = self.pssh.download_file("/remote/file.json", "/tmp/local.json", suffix_separator=".")
+        result = self.handle.download_file("/remote/file.json", "/tmp/local.json", suffix_separator=".")
 
         self.assertEqual(
             result,
@@ -1049,8 +1049,8 @@ class TestPsshFileTransfer(unittest.TestCase):
     def test_download_file_targets_only_requested_host(self):
         target_client = MagicMock()
         target_client.copy_remote_file.return_value = [self._ok_greenlet()]
-        with patch("cvs.lib.parallel.pssh.ParallelSSHClient", return_value=target_client) as mock_client:
-            result = self.pssh.download_file("/remote/file.json", "/tmp/local.json", hosts=["host2"])
+        with patch("cvs.lib.parallel.phandle.ParallelSSHClient", return_value=target_client) as mock_client:
+            result = self.handle.download_file("/remote/file.json", "/tmp/local.json", hosts=["host2"])
 
         self.assertEqual(result, {"host2": "/tmp/local.json_host2"})
         self.mock_client.copy_remote_file.assert_not_called()
@@ -1062,7 +1062,7 @@ class TestPsshFileTransfer(unittest.TestCase):
 
     def test_download_file_rejects_unknown_target_host(self):
         with self.assertRaisesRegex(ValueError, "unreachable host"):
-            self.pssh.download_file("/remote/file.json", "/tmp/local.json", hosts=["host3"])
+            self.handle.download_file("/remote/file.json", "/tmp/local.json", hosts=["host3"])
         self.mock_client.copy_remote_file.assert_not_called()
 
     def test_download_file_partial_failure_raises_ioerror(self):
@@ -1075,7 +1075,7 @@ class TestPsshFileTransfer(unittest.TestCase):
         ]
 
         with self.assertRaises(IOError) as cm:
-            self.pssh.download_file("/remote/file.json", "/tmp/local.json")
+            self.handle.download_file("/remote/file.json", "/tmp/local.json")
 
         msg = str(cm.exception)
         self.assertIn("download_file '/remote/file.json' -> '/tmp/local.json'", msg)
@@ -1090,7 +1090,7 @@ class TestPsshFileTransfer(unittest.TestCase):
         ]
 
         with self.assertRaises(IOError) as cm:
-            self.pssh.download_file("/remote/file.json", "/tmp/local.json")
+            self.handle.download_file("/remote/file.json", "/tmp/local.json")
 
         self.assertIn("download_file '/remote/file.json' -> '/tmp/local.json'", str(cm.exception))
         self.assertIn("failed on 2/2 hosts", str(cm.exception))
@@ -1101,7 +1101,7 @@ class TestPsshFileTransfer(unittest.TestCase):
             self._ok_greenlet(),
         ]
 
-        self.pssh.download_file("/remote/dir", "/tmp/local", recurse=True)
+        self.handle.download_file("/remote/dir", "/tmp/local", recurse=True)
 
         self.mock_client.copy_remote_file.assert_called_once_with(
             "/remote/dir", "/tmp/local", recurse=True, suffix_separator="_"
@@ -1112,18 +1112,18 @@ class TestPsshFileTransfer(unittest.TestCase):
     def test_scp_file_delegates_to_upload_file(self):
         # scp_file must call upload_file with the same args. We patch upload_file
         # to confirm delegation rather than reimplementing the underlying mock.
-        with patch.object(Pssh, "upload_file") as mock_upload:
-            self.pssh.scp_file("/tmp/local.json", "/remote/dest.json", recurse=True)
+        with patch.object(ParallelHandle, "upload_file") as mock_upload:
+            self.handle.scp_file("/tmp/local.json", "/remote/dest.json", recurse=True)
             mock_upload.assert_called_once_with("/tmp/local.json", "/remote/dest.json", recurse=True)
 
     def test_scp_file_propagates_ioerror_from_upload_file(self):
         # When upload_file raises, scp_file lets it propagate (no swallowing)
-        with patch.object(Pssh, "upload_file", side_effect=IOError("boom")):
+        with patch.object(ParallelHandle, "upload_file", side_effect=IOError("boom")):
             with self.assertRaises(IOError):
-                self.pssh.scp_file("/tmp/local.json", "/remote/dest.json")
+                self.handle.scp_file("/tmp/local.json", "/remote/dest.json")
 
 
-class TestPsshScpFile(unittest.TestCase):
+class TestParallelHandleScpFile(unittest.TestCase):
     """
     Regression test from main (commit 79d7b20) covering scp_file's exception
     semantics. With our PR, scp_file is a backward-compatible alias for
@@ -1132,14 +1132,14 @@ class TestPsshScpFile(unittest.TestCase):
     file paths, and the original exception is chained via __cause__.
     """
 
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
     def setUp(self, mock_pssh_client):
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         # Mock the pool.join() method that gets called in scp_file
         self.mock_client.pool = MagicMock()
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, ["host1"], user="user", password="pass")
+        self.handle = ParallelHandle(self.mock_log, ["host1"], user="user", password="pass")
 
     def test_scp_file_preserves_original_io_error(self):
         # Regression (B3): scp_file's exception handler used to read:
@@ -1160,7 +1160,7 @@ class TestPsshScpFile(unittest.TestCase):
         self.mock_client.copy_file.return_value = [fake_cmd]
 
         with self.assertRaises(IOError) as ctx:
-            self.pssh.scp_file("/local/x", "/remote/y")
+            self.handle.scp_file("/local/x", "/remote/y")
 
         # Must be IOError, not bare Exception (so callers catching IOError
         # actually catch it).
@@ -1174,16 +1174,16 @@ class TestPsshScpFile(unittest.TestCase):
         self.assertIs(ctx.exception.__cause__, original_error)
 
 
-class TestPsshInactivityTimeout(unittest.TestCase):
+class TestParallelHandleInactivityTimeout(unittest.TestCase):
     """Per-line inactivity timeout: resets on output, fires only on a stall."""
 
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
     def setUp(self, mock_pssh_client):
         self.mock_client = MagicMock()
         mock_pssh_client.return_value = self.mock_client
         self.host_list = ["host1"]
         self.mock_log = MagicMock()
-        self.pssh = Pssh(self.mock_log, self.host_list, user="user", password="pass")
+        self.handle = ParallelHandle(self.mock_log, self.host_list, user="user", password="pass")
 
     @staticmethod
     def _slow_stream(gaps, lines):
@@ -1204,7 +1204,7 @@ class TestPsshInactivityTimeout(unittest.TestCase):
         out.exception = None
         self.mock_client.run_command.return_value = [out]
 
-        result = self.pssh.exec("run", inactivity_timeout=0.5)
+        result = self.handle.exec("run", inactivity_timeout=0.5)
 
         # No total cap should be passed to run_command when inactivity is set.
         self.mock_client.run_command.assert_called_once_with("run", stop_on_errors=True)
@@ -1224,35 +1224,35 @@ class TestPsshInactivityTimeout(unittest.TestCase):
         self.mock_client.run_command.return_value = [out]
 
         with self.assertRaises(Timeout):
-            self.pssh.exec("run", inactivity_timeout=0.3)
+            self.handle.exec("run", inactivity_timeout=0.3)
 
 
-class TestPsshDestroyClients(unittest.TestCase):
+class TestParallelHandleDestroyClients(unittest.TestCase):
     """destroy_clients must actually tear the SSH transport down.
 
     A timed-out exec leaves the per-host greenlet in client.cmds unfinished.
     That greenlet's callable is a bound method of the ParallelSSHClient, so the
     client stays reachable, SSHClient.__del__ never runs, and the sshd session
-    survives the Pssh object -- verified against a live sshd. Dropping the
+    survives the ParallelHandle object -- verified against a live sshd. Dropping the
     reference is therefore not enough; the teardown has to be explicit.
     """
 
-    @patch("cvs.lib.parallel.pssh.ParallelSSHClient")
-    def _make_pssh(self, mock_pssh_client, host_clients=None, cmds=None):
+    @patch("cvs.lib.parallel.phandle.ParallelSSHClient")
+    def _make_handle(self, mock_pssh_client, host_clients=None, cmds=None):
         mock_client = MagicMock()
         mock_client.cmds = cmds
         mock_client._host_clients = host_clients if host_clients is not None else {}
         mock_pssh_client.return_value = mock_client
-        pssh = Pssh(MagicMock(), ["host1"], user="user", password="pass")
-        return pssh, mock_client
+        handle = ParallelHandle(MagicMock(), ["host1"], user="user", password="pass")
+        return handle, mock_client
 
     def test_destroy_clients_disconnects_each_host_client(self):
         # The per-host SSHClient owns the socket; without an explicit
         # _disconnect() the session is left open on the server.
         host_client = MagicMock()
-        pssh, client = self._make_pssh(host_clients={(0, "host1"): host_client})
+        handle, client = self._make_handle(host_clients={(0, "host1"): host_client})
 
-        pssh.destroy_clients()
+        handle.destroy_clients()
 
         host_client._disconnect.assert_called_once_with()
 
@@ -1260,10 +1260,10 @@ class TestPsshDestroyClients(unittest.TestCase):
         # Unfinished greenlets from a timed-out exec are what pin the client;
         # they must be killed or the disconnect above is unreachable.
         greenlet = MagicMock()
-        pssh, client = self._make_pssh(cmds=[greenlet])
+        handle, client = self._make_handle(cmds=[greenlet])
 
-        with patch("cvs.lib.parallel.pssh.killall") as mock_killall:
-            pssh.destroy_clients()
+        with patch("cvs.lib.parallel.phandle.killall") as mock_killall:
+            handle.destroy_clients()
 
         mock_killall.assert_called_once()
         self.assertEqual(list(mock_killall.call_args.args[0]), [greenlet])
@@ -1273,9 +1273,9 @@ class TestPsshDestroyClients(unittest.TestCase):
         dead = MagicMock()
         dead._disconnect.side_effect = OSError("connection already gone")
         alive = MagicMock()
-        pssh, client = self._make_pssh(host_clients={(0, "h1"): dead, (1, "h2"): alive})
+        handle, client = self._make_handle(host_clients={(0, "h1"): dead, (1, "h2"): alive})
 
-        pssh.destroy_clients()
+        handle.destroy_clients()
 
         alive._disconnect.assert_called_once_with()
 

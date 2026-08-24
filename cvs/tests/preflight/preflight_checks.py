@@ -20,7 +20,7 @@ from cvs.lib.preflight.tier3_info import Tier3InfoCheck
 
 # RdmaConnectivityCheck not used - using legacy function temporarily
 from cvs.lib.preflight.report import PreflightReportGenerator
-from cvs.lib.parallel.multiprocess_pssh import MultiProcessPssh as Pssh
+from cvs.lib.parallel.multiprocess_phandle import MultiProcessParallelHandle
 from cvs.lib.parallel.config import ParallelConfig
 from cvs.lib.utils_lib import *
 from cvs.lib.verify_lib import *
@@ -296,7 +296,7 @@ def config_dict(config_file, cluster_dict):
 @pytest.fixture(scope="module")
 def phdl(cluster_dict, config_dict):
     """
-    Build and return a parallel SSH handle (Pssh) for all cluster nodes.
+    Build and return a MultiProcessParallelHandle for all cluster nodes.
 
     Args:
       cluster_dict (dict): Cluster metadata fixture containing:
@@ -305,7 +305,7 @@ def phdl(cluster_dict, config_dict):
         - priv_key_file: path to SSH private key
 
     Returns:
-      Pssh: Handle configured for all nodes (for broadcast/parallel operations).
+      MultiProcessParallelHandle: Handle configured for all nodes (for broadcast/parallel operations).
     """
     node_list = list(cluster_dict['node_dict'].keys())
     env_vars = cluster_dict.get("env_vars")
@@ -326,7 +326,7 @@ def phdl(cluster_dict, config_dict):
     )
     config = ParallelConfig(hosts_per_shard=hosts_per_shard)
 
-    phdl = Pssh(
+    phdl = MultiProcessParallelHandle(
         log,
         node_list,
         user=cluster_dict['username'],
@@ -344,19 +344,19 @@ def phdl(cluster_dict, config_dict):
 @pytest.fixture(scope="module")
 def shdl(cluster_dict):
     """
-    Build and return a parallel SSH handle (Pssh) for the head node only.
+    Build and return a MultiProcessParallelHandle for the head node only.
 
     Args:
       cluster_dict (dict): Cluster metadata fixture (see phdl docstring).
 
     Returns:
-      Pssh: Handle configured for head node only (for single-node operations).
+      MultiProcessParallelHandle: Handle configured for head node only (for single-node operations).
     """
     head_node = cluster_dict['head_node_dict']['mgmt_ip']
     env_vars = cluster_dict.get("env_vars")
     log.info(f"Creating single SSH handle for head node: {head_node}")
 
-    shdl = Pssh(
+    shdl = MultiProcessParallelHandle(
         log,
         [head_node],
         user=cluster_dict['username'],
