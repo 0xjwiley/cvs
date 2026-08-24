@@ -4,6 +4,9 @@ PyTorch XDit WAN 2.2 Image-to-Video A14B inference test.
 Runs WAN 2.2 I2V-A14B PyTorch inference inside amdsiloai/pytorch-xdit container
 and validates results against configured thresholds.
 
+Supports native checkpoints (``Wan-AI/Wan2.2-I2V-A14B``) and Diffusers layouts
+(``Wan-AI/Wan2.2-I2V-A14B-Diffusers``).
+
 Copyright 2025 Advanced Micro Devices, Inc.
 All rights reserved.
 """
@@ -14,6 +17,7 @@ import re
 import shlex
 import socket
 import subprocess
+from typing import Optional
 
 from cvs.lib.parallel_ssh_lib import Pssh
 from cvs.lib.utils_lib import (
@@ -27,6 +31,10 @@ from cvs.lib import docker_lib
 from cvs.lib import globals
 from cvs.parsers.schemas import ClusterConfigFile, PytorchXditWanConfigFile
 from cvs.lib.inference.pytorch_xdit.pytorch_xdit_wan import WanOutputParser
+from cvs.lib.inference.pytorch_xdit.pytorch_xdit_wan_job import (
+    launch_wan_benchmark,
+    store_resolved_wan_model_format_from_index,
+)
 
 log = globals.log
 
@@ -320,6 +328,22 @@ def test_cleanup_stale_containers(s_phdl, inference_dict):
     log.info("Container cleanup completed on all nodes")
 
 
+def _read_model_index_from_node(s_phdl, node: str, model_dir: str) -> Optional[dict]:
+    """Read model_index.json from a remote model directory on one node."""
+    index_path = f"{model_dir.rstrip('/')}/model_index.json"
+    output = s_phdl.exec(
+        f"cat {shlex.quote(index_path)}",
+        print_console=False,
+    ).get(node, "")
+    if not (output or "").strip():
+        return None
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError:
+        log.warning("Could not parse model_index.json from %s on %s", index_path, node)
+        return None
+
+
 def test_verify_hf_cache_or_download(s_phdl, inference_dict, hf_token):
     """
     Verify the model is present locally on all nodes (no downloads).
@@ -362,6 +386,9 @@ def test_verify_hf_cache_or_download(s_phdl, inference_dict, hf_token):
 
         inference_dict["_resolved_model_mount_host"] = host_model_path
         inference_dict["_resolved_ckpt_dir_container"] = "/model"
+        model_index = _read_model_index_from_node(s_phdl, s_phdl.host_list[0], host_model_path)
+        if model_index:
+            store_resolved_wan_model_format_from_index(inference_dict, model_index)
         log.info(f"Using local model path: {host_model_path} (mounted to /model in container) on all nodes")
         update_test_result()
         return
@@ -390,6 +417,9 @@ def test_verify_hf_cache_or_download(s_phdl, inference_dict, hf_token):
         return
 
     inference_dict["_resolved_ckpt_dir_container"] = f"/hf_home/hub/models--{model_path_safe}/snapshots/{model_rev}"
+    model_index = _read_model_index_from_node(s_phdl, s_phdl.host_list[0], snapshot_dir_host)
+    if model_index:
+        store_resolved_wan_model_format_from_index(inference_dict, model_index)
     log.info(f"Using pre-cached snapshot: {inference_dict['_resolved_ckpt_dir_container']} on all nodes")
 
     update_test_result()
@@ -397,161 +427,19 @@ def test_verify_hf_cache_or_download(s_phdl, inference_dict, hf_token):
 
 def test_run_wan22_benchmark(s_phdl, inference_dict, benchmark_params_dict, hf_token):
     """
-    Run WAN 2.2 I2V-A14B benchmark inside pytorch-xdit container on all nodes in parallel.
-
-    Executes torchrun with configured parameters and mounts:
-    - HF cache to /hf_home
-    - Output directory to /outputs
+    Run WAN 2.2 I2V-A14B benchmark (native or Diffusers layout) on all cluster nodes.
     """
     globals.error_list = []
 
-    container_image = inference_dict['container_image']
-    container_name = inference_dict['container_name']
-    hf_home = inference_dict['hf_home']
-    output_base_dir = inference_dict['output_base_dir']
-    model_repo = inference_dict['model_repo']
-    model_rev = inference_dict['model_rev']
-
-    # Get benchmark parameters
-    wan_params = benchmark_params_dict['wan22_i2v_a14b']
-    prompt = wan_params['prompt']
-    size = wan_params['size']
-    frame_num = wan_params['frame_num']
-    num_benchmark_steps = wan_params['num_benchmark_steps']
-    compile_flag = "--compile" if wan_params['compile'] else ""
-    torchrun_nproc = wan_params['torchrun_nproc']
-
-    # Get hostnames from all nodes
-    log.info(f"Getting hostnames from {len(s_phdl.host_list)} node(s)")
-    hostname_result = s_phdl.exec('hostname')
-    node_to_hostname = {node: hostname_result[node].strip() for node in s_phdl.host_list}
-
-    # Prefer the resolved checkpoint dir computed in test_verify_hf_cache_or_download.
-    ckpt_dir = inference_dict.get("_resolved_ckpt_dir_container")
-    if not ckpt_dir:
-        # Fallback to prior behavior but still offline (assumes cache is pre-populated).
-        model_path_safe = model_repo.replace("/", "--")
-        ckpt_dir = f"/hf_home/hub/models--{model_path_safe}/snapshots/{model_rev}"
-
-    # Build common docker command components
-    device_list = inference_dict['container_config']['device_list']
-    volume_dict = inference_dict['container_config']['volume_dict']
-    env_dict = inference_dict['container_config']['env_dict']
-
-    # Build device arguments
-    device_args = " ".join([f"--device={dev}" for dev in device_list])
-
-    # Build environment arguments (common to all nodes)
-    env_dict_full = env_dict.copy()
-    env_dict_full['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
-    env_dict_full['OMP_NUM_THREADS'] = '16'
-    env_dict_full['HF_HOME'] = '/hf_home'
-    if hf_token:
-        env_dict_full['HF_TOKEN'] = hf_token
-    env_args = " ".join([f"-e {key}={value}" for key, value in env_dict_full.items()])
-
-    # Build torchrun command (common to all nodes)
-    torchrun_cmd = (
-        f"torchrun --nproc_per_node={torchrun_nproc} /app/Wan2.2/run.py "
-        f"--task i2v-A14B "
-        f"--size \"{size}\" "
-        f"--ckpt_dir \"{ckpt_dir}\" "
-        f"--image /app/Wan2.2/examples/i2v_input.JPG "
-        f"--save_file /outputs/outputs/video.mp4 "
-        f"--ulysses_size 8 "
-        f"--ring_size 1 "
-        f"--vae_dtype bfloat16 "
-        f"--frame_num {frame_num} "
-        f"--prompt \"{prompt}\" "
-        f"--benchmark_output_directory /outputs "
-        f"--num_benchmark_steps {num_benchmark_steps} "
-        f"--offload_model 0 "
-        f"--allow_tf32 "
-        f"{compile_flag}"
+    errors = launch_wan_benchmark(
+        s_phdl,
+        inference_dict,
+        benchmark_params_dict,
+        hf_token,
+        distributed=False,
     )
-
-    # Create per-node output directories and build per-node docker commands
-    mkdir_cmds = []
-    docker_cmds = []
-
-    for node in s_phdl.host_list:
-        hostname = node_to_hostname[node]
-        output_dir = f"{output_base_dir}/wan_22_{hostname}_outputs"
-        outputs_dir = f"{output_dir}/outputs"
-
-        # Create output directory command
-        mkdir_cmds.append(f"mkdir -p {outputs_dir}")
-
-        # Build volume arguments with per-node output directory
-        volume_dict_full = volume_dict.copy()
-        volume_dict_full[output_dir] = "/outputs"
-        volume_dict_full[hf_home] = "/hf_home"
-        # If user provided an explicit local model path, mount it consistently to /model.
-        if inference_dict.get("_resolved_model_mount_host"):
-            volume_dict_full[inference_dict["_resolved_model_mount_host"]] = "/model"
-        volume_args = " ".join(
-            [f"--mount type=bind,source={src},target={dst}" for src, dst in volume_dict_full.items()]
-        )
-
-        # Full docker command for this node
-        docker_cmd = (
-            f"docker run "
-            f"--cap-add=SYS_PTRACE "
-            f"--security-opt seccomp=unconfined "
-            f"--user root "
-            f"{device_args} "
-            f"--ipc=host "
-            f"--network host "
-            f"--rm "
-            f"--privileged "
-            f"--name {container_name} "
-            f"{volume_args} "
-            f"{env_args} "
-            f"{container_image} "
-            f"{torchrun_cmd}"
-        )
-        docker_cmds.append(docker_cmd)
-        log.info(f"Node {node} ({hostname}) will write to: {output_dir}")
-
-    # Create output directories on all nodes in parallel
-    log.info(f"Creating output directories on {len(s_phdl.host_list)} node(s)")
-    s_phdl.exec_cmd_list(mkdir_cmds)
-
-    log.info(f"Running WAN 2.2 benchmark on {len(s_phdl.host_list)} node(s) in parallel")
-    log.debug(f"Docker command (sample): {_redact_secrets(docker_cmds[0])}")
-
-    try:
-        # Run benchmarks on all nodes in parallel
-        log.info("Starting benchmarks (this may take several minutes)...")
-        benchmark_results = s_phdl.exec_cmd_list(docker_cmds, timeout=1800)  # 30 min timeout
-
-        log.info("Benchmarks completed on all nodes")
-
-        # Check for common failure patterns on each node
-        fatal_patterns = [
-            r"\bTraceback\b",
-            r"\bModuleNotFoundError\b",
-            r"\bChildFailedError\b",
-            r"No AMD GPU detected",
-            r"0 active drivers \(\[\]\)\. There should only be one\.",
-        ]
-
-        failed_nodes = []
-        for node, output in benchmark_results.items():
-            if any(re.search(p, output, re.I) for p in fatal_patterns):
-                log.error(f"Benchmark on {node} indicates a failure")
-                failed_nodes.append(node)
-            else:
-                log.info(f"Benchmark on {node} completed successfully")
-
-        if failed_nodes:
-            fail_test(f"Benchmark failed on {len(failed_nodes)} node(s): {', '.join(failed_nodes)}")
-
-    except Exception as e:
-        fail_test(f"Benchmark execution failed with exception: {e}")
-
-    # Note: _test_output_dir is no longer set since we run on multiple nodes.
-    # The parsing test will use output_base_dir to find all wan_22_*_outputs directories.
+    if errors:
+        fail_test(f"Following FAILURES seen - {errors}")
 
     update_test_result()
 
