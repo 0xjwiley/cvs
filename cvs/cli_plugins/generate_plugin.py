@@ -27,7 +27,7 @@ class GeneratorPlugin(ABC):
 
     @abstractmethod
     def generate(self, args):
-        """Generate the output based on parsed arguments"""
+        """Generate output and return None or 0 on success, or a nonzero status on failure."""
         pass
 
     def supports_raw_argv(self):
@@ -118,7 +118,9 @@ def _run_generator(generator_name, args):
         else:
             parsed_args = parser.parse_args(args)
         # Call the plugin's generate method
-        plugin.generate(parsed_args)
+        exit_code = plugin.generate(parsed_args)
+        if exit_code not in (None, 0):
+            sys.exit(exit_code)
     except SystemExit as e:
         # argparse exits with SystemExit on help or error
         sys.exit(e.code)
