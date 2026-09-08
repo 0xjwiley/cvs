@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Versioned diagnostic result schemas with explicit execution, coverage and threshold provenance, plus deterministic JSON serialization.
 - Installable Python package layout: tests, lib, and input live under `cvs/`; `cvs` CLI; Makefile install/test targets.
 - JAX MaxText training suite: smoke test, checkpoint save/resume I/O timing metrics, additional model configs and threshold files.
 - TorchTitan single-node and distributed training suites.
