@@ -4,12 +4,11 @@ All rights reserved. This notice is intended as a precaution against inadvertent
 The year included in the foregoing notice is the year of creation of the work.
 All code contained here is Property of Advanced Micro Devices, Inc.
 
-Unified Megatron training suite for distributed (multi-node) runs.
-Topology is determined by the config file:
-  framework=megatron_distributed  -> multi-node (distributed_training=True)
+Unified Megatron training suite for distributed (multi-node) runs (distributed_training=True).
 
 Lifecycle (each stage is a separate test):
   test_launch_container  — launch the container once for all sweep combos
+  test_download_tokenizer — download HF tokenizer when the model needs a local file
   test_smoke             — fixed small cell: model loads and runs N steps without error
   test_checkpoint        — Primus-only: checkpoint save + resume correctness check
   test_training          — parametrized: one test per sweep combo; kills GPU
@@ -136,7 +135,7 @@ def test_download_tokenizer(orch, variant_config, hf_token, lifecycle, request):
         lifecycle.tokenizer_path = None
         log.info(
             "test_download_tokenizer: no local tokenizer needed for %s — skipping download",
-            variant_config.model_params["tokenizer_model"],
+            variant_config.train_params["tokenizer_model"],
         )
         return
 
@@ -153,28 +152,36 @@ def test_download_tokenizer(orch, variant_config, hf_token, lifecycle, request):
 
 
 def test_smoke(orch, variant_config, hf_token, lifecycle, request):
-    """Stage 2: smoke-test — model loads and runs _SMOKE_ITERS steps without error.
+    """Stage 2: smoke-test — model loads and runs smoke.iters steps without error.
 
-    Passes if training reaches iteration _SMOKE_ITERS/_SMOKE_ITERS without error.
-    No metric assertions — completion without error is the only requirement.
+    Knobs come from the top-level ``smoke`` block. Empty ``global_batch_size``
+    keeps the distributed default of 16. Set ``smoke.enabled`` false to skip.
+    Completion without error is the only requirement — no metric assertions.
     """
+    smoke = variant_config.smoke
+    if not smoke.enabled:
+        pytest.skip("smoke.enabled=false in config; skipping test_smoke")
     if lifecycle.failed:
         pytest.skip("a prior lifecycle stage failed")
 
     globals.error_list = []
+    mbs = smoke.micro_batch_size or _SMOKE_MBS
+    gbs = smoke.global_batch_size.strip() or _SMOKE_GBS
+    precision = smoke.precision or _SMOKE_PRECISION
+    iters = int(smoke.iters)
 
     mt_obj = _make_training_job(
         orch,
         variant_config,
         hf_token=hf_token,
-        micro_batch_size=_SMOKE_MBS,
-        global_batch_size=_SMOKE_GBS,
-        precision=_SMOKE_PRECISION,
+        micro_batch_size=mbs,
+        global_batch_size=gbs,
+        precision=precision,
         distributed_training=True,
         tune_model_params=False,
         run_label="smoke",
     )
-    mt_obj.iterations = int(_SMOKE_ITERS)
+    mt_obj.iterations = iters
     mt_obj.local_tokenizer_path = getattr(lifecycle, "tokenizer_path", None)
 
     t = time.monotonic()
@@ -192,7 +199,7 @@ def test_smoke(orch, variant_config, hf_token, lifecycle, request):
         lifecycle.failed = True
     update_test_result()
     lifecycle.record(request.node.nodeid, "smoke", time.monotonic() - t)
-    log.info("smoke PASSED | iters=%s", _SMOKE_ITERS)
+    log.info("smoke PASSED | iters=%s mbs=%s gbs=%s precision=%s", iters, mbs, gbs, precision)
 
 
 def test_checkpoint(orch, variant_config, hf_token, lifecycle, request):
@@ -515,11 +522,17 @@ def test_metric(variant_config, micro_batch_size, global_batch_size, precision, 
     violations = []
     for metric, spec in thresholds.items():
         if metric not in actuals:
+            if spec.get("optional"):
+                log.info("  SKIPPED  %s: missing from actuals", metric)
+                continue
             msg = f"{metric}: missing from actuals"
             log.error("  FAILED  %s", msg)
             violations.append(msg)
             continue
         if actuals[metric] is None:
+            if spec.get("optional"):
+                log.info("  SKIPPED  %s: value is None (metric unavailable for this run)", metric)
+                continue
             msg = f"{metric}: value is None (metric unavailable for this run)"
             log.error("  FAILED  %s", msg)
             violations.append(msg)
@@ -582,7 +595,7 @@ def test_loss_curve(
         _Path(out_dir).mkdir(parents=True, exist_ok=True)
         fname = f"loss_curve_{combo_key}_{str(_uuid.uuid4()).split('-')[-1]}.png"
         png_path = _Path(out_dir) / fname
-        title = f"Training Loss Curve — {variant_config.model_params.get('model_name', '')} [{combo_key}]"
+        title = f"Training Loss Curve — {variant_config.train_params.get('model_name', '')} [{combo_key}]"
         rendered = render_loss_curve_png(points, png_path, title=title)
         if rendered and mgr_enabled:
             rel_path = str(_Path(rendered).relative_to(mgr.htmlpath.parent))
