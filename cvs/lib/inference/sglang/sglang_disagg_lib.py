@@ -30,6 +30,7 @@ from cvs.lib.inference.sglang.sglang_common import (
     format_sglang_gpu_topology_lines,
     normalize_hosts,
     parse_inference_bench_results,
+    perf_enforce_thresholds,
     poll_for_inference_completion as poll_for_inference_completion_common,
     resolve_client_host,
     run_lm_eval_benchmark_test as run_lm_eval_benchmark_test_common,
@@ -103,11 +104,6 @@ class SglangDisaggPD:
         self.inf_dict = inference_config_dict
         self.bp_dict = benchmark_params_dict
 
-        self.mount_vol = self.inf_dict.get(
-            'mount_vol',
-            '/usr/lib/x86_64-linux-gnu/libibverbs/libbnxt_re-rdmav34.so',
-        )
-
         self.prefill_node_list = normalize_hosts(self.inf_dict['prefill_node_list'])
         self.decode_node_list = normalize_hosts(self.inf_dict['decode_node_list'])
         self.prefill_nnodes = len(self.prefill_node_list)
@@ -129,8 +125,6 @@ class SglangDisaggPD:
         self._apply_bp_defaults()
 
         self.container_name = self.inf_dict['container_name']
-        self.nic_type = self.inf_dict['nic_type']
-        self.nccl_ib_hca_list = self.inf_dict['nccl_ib_hca_list']
         self.nccl_ib_hca = self.inf_dict['nccl_ib_hca']
         self.nccl_socket_ifname = self.inf_dict['nccl_socket_ifname']
         self.gloo_socket_ifname = self.inf_dict['gloo_socket_ifname']
@@ -217,8 +211,6 @@ class SglangDisaggPD:
     def _apply_inf_defaults(self) -> None:
         self.inf_dict.setdefault('container_image', 'lmsysorg/sglang:dev')
         self.inf_dict.setdefault('container_name', 'sglang_container')
-        self.inf_dict.setdefault('nic_type', 'ainic')
-        self.inf_dict.setdefault('nccl_ib_hca_list', 'rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7')
         self.inf_dict.setdefault('nccl_ib_hca', 'rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7')
         self.inf_dict.setdefault('hca_id_prefix', 'bnxt_')
         self.inf_dict.setdefault('nccl_socket_ifname', 'eno0')
@@ -288,30 +280,13 @@ class SglangDisaggPD:
     def exec_nic_setup_scripts(
         self,
     ):
-        """
-        Execute NIC-related setup steps inside the inference container.
-
-        Behavior:
-        - Only runs for distributed inference.
-        - If NIC type appears to be Broadcom/Thor, applies a temporary workaround:
-          * Copies the bnxt RDMA library from the host-named file to the container's expected path.
-          * Verifies that ibv_devinfo shows a bnxt_ HCA (to confirm RDMA is wired correctly).
-        - Forces NCCL GID index to 3 for Broadcom/Thor (common requirement).
-
-        Assumptions:
-        - sudo is non-interactive within the container.
-        - The bnxt library file paths exist in the container base image.
-        """
-        if re.search('broadcom|thor', self.nic_type, re.I):
-            self.nccl_ib_gid_index = 3
-            cmd = "bash -c " + shlex.quote(f"cp {self.mount_vol}.host {self.mount_vol}; sleep 2; ibv_devinfo; sleep 2;")
-            hca_id_regex = rf'hca_id:\s+{re.escape(self.hca_id_prefix)}'
-            for hosts in (self.prefill_node_list, self.decode_node_list):
-                out_dict = self._container_exec(cmd, hosts=hosts)
-                for node, out in out_dict.items():
-                    if not re.search(hca_id_regex, out or '', re.I):
-                        log.info("%s", out)
-                        fail_test(f'Broadcom libbnxt rdma driver is not properly copied on node {node}')
+        hca_id_regex = rf'hca_id:\s+{re.escape(self.hca_id_prefix)}'
+        for hosts in (self.prefill_node_list, self.decode_node_list):
+            out_dict = self._container_exec("ibv_devinfo", hosts=hosts)
+            for node, out in out_dict.items():
+                if not re.search(hca_id_regex, out or '', re.I):
+                    log.info("%s", out)
+                    fail_test(f'HCA not visible on node {node}')
 
     def check_ibv_devices(
         self,
@@ -934,6 +909,7 @@ class SglangDisaggPD:
             expected_result_dict,
             self._host_exec,
             test_name=test_name,
+            enforce_thresholds=perf_enforce_thresholds(self.bp_dict),
         )
 
     def verify_inference_results_subtests(
@@ -954,6 +930,7 @@ class SglangDisaggPD:
             test_name,
             lifecycle=lifecycle,
             report_nodeid=report_nodeid,
+            enforce_thresholds=perf_enforce_thresholds(self.bp_dict),
         )
         return all_passed
 

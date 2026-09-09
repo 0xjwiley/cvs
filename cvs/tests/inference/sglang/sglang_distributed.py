@@ -51,12 +51,12 @@ def test_launch_container(orch, variant_config, lifecycle, request):
     lifecycle.complete_stage(request, "container_launch", t0)
 
 
-# def test_setup_ibv_devices(im_obj, lifecycle, request):
-#     globals.error_list = []
-#     t0 = time.monotonic()
-#     im_obj.exec_nic_setup_scripts()
-#     im_obj.check_ibv_devices()
-#     lifecycle.complete_stage(request, "ibv_setup", t0)
+def test_setup_ibv_devices(im_obj, lifecycle, request):
+    globals.error_list = []
+    t0 = time.monotonic()
+    im_obj.exec_nic_setup_scripts()
+    im_obj.check_ibv_devices()
+    lifecycle.complete_stage(request, "ibv_setup", t0)
 
 
 def test_rms_norm(im_obj, lifecycle, request):
@@ -112,6 +112,8 @@ def test_run_performance_benchmark_test(im_obj, inf_res_dict, lifecycle, request
     globals.error_list = []
     t0 = time.monotonic()
     bench = im_obj.bp_dict["inference_tests"]["bench_serv_random"]
+    bench.clear()
+    bench.update(perf_cell["benchmark_params"])
     bench["input_length"] = perf_cell["isl"]
     bench["output_length"] = perf_cell["osl"]
     bench.setdefault("expected_results", {})["auto"] = dict(perf_cell["specs"])

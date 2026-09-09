@@ -9,21 +9,24 @@ of role hosts (not every host in cluster.json unless all are assigned roles).
 Run:
   pytest cvs/tests/inference/sglang/sglang_disagg_distributed.py \\
     --cluster_file cvs/input/cluster_file/cluster_container.json \\
-    --config_file cvs/input/config_file/inference/sglang/mi30x_sglang_distributed.json \\
+    --config_file cvs/input/config_file/inference/sglang/mi3xx_sglang_llama_70b_disaggregated.json \\
     --html=~/cvs_results/sglang_disagg.html
 
 ``cluster_container.json`` ``node_dict`` must include all prefill/decode/router/bench hosts.
-Model variant is selected from ``benchmark_params`` via ``active_benchmark`` / env / single-key auto.
+Workload, runtime, and accuracy settings come from the unified SGLang config.
 
 With ``--html``, session end also writes ``sglang_run_deck.html`` (plus JSON
 and interactive viewer) via ``cvs/lib/report/profiles/sglang.json`` (all SGLang stems).
 '''
 
-import pytest
 import time
-from cvs.lib.inference.sglang.sglang_common import cleanup_sglang_log_dir
+
+import pytest
+
 from cvs.lib import globals
+from cvs.lib.inference.sglang.sglang_common import cleanup_sglang_log_dir
 from cvs.lib.verify_lib import verify_dmesg_for_errors
+
 # from cvs.tests.inference.sglang.conftest import flat_expected_from_specs
 
 log = globals.log
@@ -51,12 +54,12 @@ def test_launch_container(orch, variant_config, lifecycle, request):
     lifecycle.complete_stage(request, "container_launch", t0)
 
 
-# def test_setup_ibv_devices(im_obj, lifecycle, request):
-#     globals.error_list = []
-#     t0 = time.monotonic()
-#     im_obj.exec_nic_setup_scripts()
-#     im_obj.check_ibv_devices()
-#     lifecycle.complete_stage(request, "ibv_setup", t0)
+def test_setup_ibv_devices(im_obj, lifecycle, request):
+    globals.error_list = []
+    t0 = time.monotonic()
+    im_obj.exec_nic_setup_scripts()
+    im_obj.check_ibv_devices()
+    lifecycle.complete_stage(request, "ibv_setup", t0)
 
 
 def test_rms_norm(im_obj, lifecycle, request):
@@ -152,6 +155,8 @@ def test_run_performance_benchmark_test(im_obj, inf_res_dict, lifecycle, request
     globals.error_list = []
     t0 = time.monotonic()
     bench = im_obj.bp_dict["inference_tests"]["bench_serv_random"]
+    bench.clear()
+    bench.update(perf_cell["benchmark_params"])
     bench["input_length"] = perf_cell["isl"]
     bench["output_length"] = perf_cell["osl"]
     bench.setdefault("expected_results", {})["auto"] = dict(perf_cell["specs"])

@@ -27,6 +27,7 @@ from cvs.lib.inference.sglang.sglang_common import (
     first_output,
     format_sglang_gpu_topology_lines,
     parse_inference_bench_results,
+    perf_enforce_thresholds,
     poll_for_inference_completion as poll_for_inference_completion_common,
     resolve_distributed_client_host,
     resolve_server_node_list,
@@ -68,11 +69,6 @@ class SglangDistributed:
         self.inf_dict = inference_config_dict
         self.bp_dict = benchmark_params_dict
 
-        self.mount_vol = self.inf_dict.get(
-            'mount_vol',
-            '/usr/lib/x86_64-linux-gnu/libibverbs/libbnxt_re-rdmav34.so',
-        )
-
         self.inference_results_dict = {}
         log.info("%s", self.gpu_type)
 
@@ -92,7 +88,6 @@ class SglangDistributed:
         self.benchmark_serv_node = self._resolve_benchmark_serv_node()
 
         self.container_name = self.inf_dict['container_name']
-        self.nic_type = self.inf_dict['nic_type']
         self.hca_id_prefix = str(self.inf_dict['hca_id_prefix']).strip()
         self.log_dir = self.inf_dict['log_dir']
         self.inference_poll_iterations = self.bp_dict['inference_poll_iterations']
@@ -203,7 +198,6 @@ class SglangDistributed:
     def _apply_inf_defaults(self) -> None:
         self.inf_dict.setdefault('container_image', 'lmsysorg/sglang:dev')
         self.inf_dict.setdefault('container_name', 'sglang_container')
-        self.inf_dict.setdefault('nic_type', 'ainic')
         self.inf_dict.setdefault('nccl_ib_hca', 'rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7')
         self.inf_dict.setdefault('hca_id_prefix', 'bnxt_')
         self.inf_dict.setdefault('nccl_socket_ifname', 'eno0')
@@ -332,14 +326,11 @@ class SglangDistributed:
         )
 
     def exec_nic_setup_scripts(self) -> None:
-        if re.search('broadcom|thor', self.nic_type, re.I):
-            self.inf_dict['nccl_ib_gid_index'] = 3
-            cmd = "bash -c " + shlex.quote(f"cp {self.mount_vol}.host {self.mount_vol}; sleep 2; ibv_devinfo; sleep 2;")
-            out_dict = self._container_exec(cmd)
-            hca_id_regex = rf'hca_id:\s+{re.escape(self.hca_id_prefix)}'
-            for node, out in out_dict.items():
-                if not re.search(hca_id_regex, out or '', re.I):
-                    fail_test(f'Broadcom libbnxt rdma driver is not properly copied on node {node}')
+        out_dict = self._container_exec("ibv_devinfo")
+        hca_id_regex = rf'hca_id:\s+{re.escape(self.hca_id_prefix)}'
+        for node, out in out_dict.items():
+            if not re.search(hca_id_regex, out or '', re.I):
+                fail_test(f'HCA not visible on node {node}')
 
     def check_ibv_devices(self) -> None:
         out_dict = self._container_exec("ibv_devinfo")
@@ -445,6 +436,7 @@ class SglangDistributed:
             expected_result_dict,
             self._host_exec,
             test_name=test_name,
+            enforce_thresholds=perf_enforce_thresholds(self.bp_dict),
         )
 
     def verify_inference_results_subtests(
@@ -464,6 +456,7 @@ class SglangDistributed:
             test_name,
             lifecycle=lifecycle,
             report_nodeid=report_nodeid,
+            enforce_thresholds=perf_enforce_thresholds(self.bp_dict),
         )
         return all_passed
 
