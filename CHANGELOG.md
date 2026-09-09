@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Versioned diagnostic result schemas with explicit execution, coverage and threshold provenance, plus deterministic JSON serialization.
+- Run report writer that publishes one immutable `report.json` per run directory, with sealed input hashes, hashed run-local artifact references, and a Run Deck provenance mapping.
 - Installable Python package layout: tests, lib, and input live under `cvs/`; `cvs` CLI; Makefile install/test targets.
 - JAX MaxText training suite: smoke test, checkpoint save/resume I/O timing metrics, additional model configs and threshold files.
 - TorchTitan single-node and distributed training suites.
