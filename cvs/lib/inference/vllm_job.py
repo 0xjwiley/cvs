@@ -22,12 +22,11 @@ distributed flags (--node-rank, --master-addr, --master-port, --nnodes,
 int(nnodes) > 1. Everything else is topology-blind.
 
 IB device config (distributed only):
-  ib_hcas: discovered HCA names for NCCL_IB_HCA, passed in from the
-      test_discover_topology lifecycle step. Written into the per-node env
-      script.
-  ib_netdev: explicit Linux netdev name for NCCL_SOCKET_IFNAME /
-      GLOO_SOCKET_IFNAME. Read directly from variant.roles.server.ib_netdev.
-  Required for multi-host distributed execution.
+  NCCL_IB_HCA: inherited from container.env when configured there. Otherwise,
+      ib_hcas discovered by test_discover_topology are written into the
+      per-node env script.
+  Socket interfaces: inherited from container.env. The legacy top-level
+      ib_netdev fallback is written into the per-node environment script.
 '''
 
 from __future__ import annotations
@@ -41,10 +40,13 @@ import time
 from typing import Optional
 
 from cvs.lib import globals
+from cvs.lib.inference.utils.vllm_config_loader import serialize_cli_options
 from cvs.lib.inference.utils.vllm_parsing import to_client_metrics
 from cvs.lib.utils.model_query_lib import OpenAIProbe
 
 log = globals.log
+_PERCENTILE_METRICS = "ttft,tpot,itl,e2el"
+_METRIC_PERCENTILES = "50,90,95,99"
 
 
 def scrape_vllm_metrics(orch, base_url: str, port_no: str, timeout_s: "float | None" = None) -> "str | None":
@@ -78,8 +80,8 @@ def scrape_vllm_metrics(orch, base_url: str, port_no: str, timeout_s: "float | N
 class VllmJob:
     """Unified vLLM benchmark job for single-node and multinode distributed runs.
 
-    Construct with the result of test_discover_topology (ib_hcas) for distributed
-    runs; pass None (or omit) for single-node.
+    For distributed configurations without ``container.env.NCCL_IB_HCA``,
+    construct with the HCA names returned by test_discover_topology.
 
     The ``orch`` instance is expected to already have ``setup_containers()`` and
     (for multinode) ``setup_sshd()`` called against it by the test lifecycle.
@@ -111,6 +113,7 @@ class VllmJob:
         r"|RuntimeError:.*[Ee]ngine",
         re.I,
     )
+    _MAX_MODEL_LEN_PAD = 8
 
     def __init__(
         self,
@@ -121,16 +124,9 @@ class VllmJob:
         osl,
         concurrency,
         num_prompts,
+        benchmark_params=None,
         ib_hcas: Optional[list] = None,
-        goodput_slo=None,
         log_subdir="vllm",
-        server_precheck_wait_s=30,
-        server_warmup_wait_s=330,
-        server_poll_count=60,
-        server_poll_wait_s=60,
-        client_initial_wait_s=120,
-        client_poll_count=20,
-        client_poll_wait_s=60,
     ):
         self.orch = orch
         self.variant = variant
@@ -139,10 +135,7 @@ class VllmJob:
         self.osl = str(osl)
         self.concurrency = str(concurrency)
         self.num_prompts = str(num_prompts)
-        # Discovered HCA names for NCCL_IB_HCA (multinode only). Passed in from
-        # test_discover_topology so discovery runs once per lifecycle, not per cell.
-        self.ib_hcas = ib_hcas or []
-        self.goodput_slo = goodput_slo
+        self.ib_hcas = [] if variant.container.nccl_ib_hcas is not None else (ib_hcas or [])
         self.log_subdir = log_subdir
         self.hosts = tuple(orch.hosts)
         if not self.hosts:
@@ -151,49 +144,58 @@ class VllmJob:
         if topology is not None and topology.hosts != self.hosts:
             raise ValueError("vLLM topology hosts do not match the orchestrator")
 
-        p = variant.params
-        self.tp = p.tensor_parallelism
+        p = variant.server_params
+        b = dict(benchmark_params or {})
+        if not b:
+            b = variant.benchmark_params.model_dump()
+            b.update(variant.benchmark_params.extra_options())
+        self.tp = str(p.tensor_parallel_size)
         self.pp = (
             str(topology.pipeline_parallel_size)
             if topology is not None
-            else (p.pipeline_parallel_size if len(self.hosts) > 1 else "1")
+            else (str(p.pipeline_parallel_size) if len(self.hosts) > 1 else "1")
         )
-        self.master_addr = p.master_addr
-        self.master_port = p.master_port
+        self.master_addr = self.hosts[0]
+        self.master_port = str(p.dist_init_port)
         self.nnodes = str(topology.nnodes) if topology is not None else str(len(self.hosts))
-        self.port_no = p.port_no
-        self.random_range_ratio = p.random_range_ratio
-        self.random_prefix_len = p.random_prefix_len
-        self.burstiness = p.burstiness
-        self.seed = p.seed
-        self.request_rate = p.request_rate
-        self.tokenizer_mode = p.tokenizer_mode
-        self.percentile_metrics = p.percentile_metrics
-        self.metric_percentiles = p.metric_percentiles
-        self.base_url = p.base_url
-        self.dataset_name = p.dataset_name
-        self.backend = p.backend
+        self.port_no = str(p.port)
+        self.random_range_ratio = str(b["random_range_ratio"])
+        self.random_prefix_len = str(b["random_prefix_len"])
+        self.burstiness = str(b["burstiness"])
+        self.seed = str(b["seed"])
+        self.request_rate = str(b["request_rate"])
+        self.tokenizer_mode = str(b["tokenizer_mode"])
+        self.base_url = "http://0.0.0.0"
+        self.dataset_name = str(b["dataset_name"])
+        self.backend = str(b["backend"])
+        self.ignore_eos = bool(b["ignore_eos"])
+        self.trust_remote_code = bool(b["trust_remote_code"])
 
-        self.model_id = variant.model.id
+        self.model_id = p.model
         self.log_dir = variant.paths.log_dir
-        self.serve_args = dict(variant.roles.server.serve_args)
-        if len(self.hosts) == 1:
-            self.serve_args.pop("distributed-executor-backend", None)
-        self.server_env = dict(variant.roles.server.env)
+        self.serve_args = p.extra_options()
+        self.distributed_executor_backend = p.distributed_executor_backend
+        self.benchmark_options = {
+            key: value
+            for key, value in b.items()
+            if key not in type(variant.benchmark_params).model_fields
+            and key not in {"random_input_len", "random_output_len", "max_concurrency"}
+        }
+        self.server_env = {}
         self.models_dir = variant.paths.models_dir
-        self.ib_netdev = variant.roles.server.ib_netdev
+        self.ib_netdev = None if variant.container.socket_env_configured else variant.ib_netdev
 
         self.out_dir = f"{self.log_dir}/{self.log_subdir}/out-node0/isl{self.isl}_osl{self.osl}_conc{self.concurrency}"
         self.server_log = f"{self.out_dir}/vllm_serve_server.log"
         self.client_log = f"{self.out_dir}/client.log"
 
-        self._precheck_wait = server_precheck_wait_s
-        self._warmup_wait = server_warmup_wait_s
-        self._server_poll_count = server_poll_count
-        self._server_poll_wait = server_poll_wait_s
-        self._client_initial_wait = client_initial_wait_s
-        self._client_poll_count = client_poll_count
-        self._client_poll_wait = client_poll_wait_s
+        self._precheck_wait = 30
+        self._warmup_wait = p.server_warmup_wait_s
+        self._server_poll_count = p.server_poll_iterations
+        self._server_poll_wait = p.server_poll_wait_s
+        self._client_initial_wait = int(b["client_initial_wait_s"])
+        self._client_poll_count = int(b["client_poll_iterations"])
+        self._client_poll_wait = int(b["client_poll_wait_s"])
 
     # ---------- derived builders ----------
 
@@ -205,31 +207,12 @@ class VllmJob:
         mutate serve_args after construction see the updated value.  Only the
         exact lowercase string 'ray' matches (AC6/AC8 case-sensitivity).
         """
-        return self.serve_args.get("distributed-executor-backend") == "ray"
-
-    _MML_PAD = 8
+        return self.distributed_executor_backend == "ray"
 
     def _derive_max_model_len(self):
-        r = float(self.random_range_ratio)
-        worst = (int(self.isl) + int(self.osl)) * (1.0 + r)
-        return str(math.ceil(worst) + int(self.random_prefix_len) + self._MML_PAD)
-
-    @staticmethod
-    def _flatten_serve_args(mapping):
-        """Convert {flag: value} serve-args map to a flat vllm serve arg list."""
-        argv = []
-        for flag, value in mapping.items():
-            opt = f"--{flag}"
-            if value is True:
-                argv.append(opt)
-            elif value is False:
-                pass  # boolean False → omit the flag entirely
-            elif isinstance(value, (list, tuple)):
-                for v in value:
-                    argv.extend([opt, str(v)])
-            else:
-                argv.extend([opt, str(value)])
-        return argv
+        ratio = float(self.random_range_ratio)
+        worst_case_length = (int(self.isl) + int(self.osl)) * (1.0 + ratio)
+        return str(math.ceil(worst_case_length) + int(self.random_prefix_len) + self._MAX_MODEL_LEN_PAD)
 
     def _server_argv(self, rank: int) -> list:
         """vllm serve arg list for a specific node rank.
@@ -246,10 +229,7 @@ class VllmJob:
             "--port",
             str(self.port_no),
         ]
-        # Emit a derived --max-model-len ONLY when the config did not set one in
-        # serve_args. Emitting both makes vllm see the flag twice (the serve_args
-        # value silently wins); the explicit config value takes precedence here.
-        if "max-model-len" not in self.serve_args:
+        if "max_model_len" not in self.serve_args:
             argv += ["--max-model-len", self._derive_max_model_len()]
         if int(self.nnodes) > 1 and not self._is_ray_backend:
             # mp multi-node: inject the full distributed-executor block.
@@ -273,7 +253,9 @@ class VllmJob:
                 argv.append("--headless")
         if int(self.nnodes) > 1 and self._is_ray_backend and int(self.pp) > 1:
             argv += ["--pipeline-parallel-size", str(self.pp)]
-        argv.extend(self._flatten_serve_args(self.serve_args))
+        if int(self.nnodes) > 1 and self._is_ray_backend:
+            argv += ["--distributed-executor-backend", "ray"]
+        argv.extend(serialize_cli_options(self.serve_args))
         return argv
 
     def _rank_log(self, rank: int) -> str:
@@ -306,9 +288,6 @@ class VllmJob:
         env_lines = [
             f"export HF_TOKEN={shlex.quote(self.hf_token)}",
             f"export HF_HUB_CACHE={shlex.quote(self.models_dir)}",
-            "export VLLM_USE_AITER_UNIFIED_ATTENTION=1",
-            "export VLLM_ROCM_USE_AITER_MHA=0",
-            "export VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4=1",
         ]
         if self.ib_hcas:
             env_lines.append(f"export NCCL_IB_HCA={shlex.quote(','.join(self.ib_hcas))}")
@@ -559,28 +538,20 @@ class VllmJob:
             "--random-prefix-len",
             self.random_prefix_len,
             "--percentile-metrics",
-            self.percentile_metrics,
+            _PERCENTILE_METRICS,
             "--metric-percentiles",
-            self.metric_percentiles,
-            "--ignore-eos",
+            _METRIC_PERCENTILES,
             "--save-result",
             "--result-dir",
             self.out_dir,
             "--result-filename",
             "results",
         ]
-        # The bench client loads the tokenizer from --model to count tokens. Some
-        # models (e.g. Kimi-K2.6) ship a custom tokenizer via tokenizer_config
-        # auto_map, which transformers refuses to load without trust-remote-code.
-        # Mirror the server's setting so the client can load the same tokenizer.
-        if self.serve_args.get("trust-remote-code") is True:
+        if self.ignore_eos:
+            args.append("--ignore-eos")
+        if self.trust_remote_code:
             args.append("--trust-remote-code")
-        if self.goodput_slo:
-            args.append("--goodput")
-            for metric, key in (("ttft", "ttft_ms"), ("tpot", "tpot_ms"), ("e2el", "e2el_ms")):
-                val = self.goodput_slo.get(key)
-                if val is not None:
-                    args.append(f"{metric}:{val}")
+        args.extend(serialize_cli_options(self.benchmark_options))
         bench_cmd = " ".join(shlex.quote(str(a)) for a in args)
         client_cmd = f"source /tmp/server_env_script.sh && {bench_cmd} > {shlex.quote(self.client_log)} 2>&1 &"
         self.orch.exec_on_head("bash -c " + shlex.quote(client_cmd))

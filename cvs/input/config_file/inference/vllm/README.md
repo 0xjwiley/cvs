@@ -39,37 +39,65 @@ using 4 GPUs per node.
 Distributed configs support one-host fallback or exactly two hosts. CVS rejects
 larger clusters until a matching N-host recipe and threshold set are available.
 
-## Sweep
+## Sweeps
 
-Every config carries all three sweep shapes:
-
-| combo suffix | ISL | OSL |
-|---|---|---|
-| `1k1k` | 1024 | 1024 |
-| `1k8k` | 1024 | 8192 |
-| `8k1k` | 8192 | 1024 |
-
-Only `1k1k` is referenced by `sweep.runs`, at concurrencies 16 and 32, so those
-are the cells a run executes. To run another shape, add it to `sweep.runs`
-**and** add the matching cell key to the threshold file — the coverage check
-compares the two.
-
-Cell keys follow the loader's format:
+`sweeps` maps canonical run-cell keys to per-cell benchmark overrides.
+`runs` is a required, ordered, explicit list of the cells to execute. To run
+every available cell, list every key in `runs`; there is no implicit "all"
+selection.
 
 ```text
-single:      ISL=1024,OSL=1024,TP=<tp>,CONC=<16|32>
-distributed: ISL=1024,OSL=1024,TP=<tp>,PP=2,CONC=<16|32>
+ISL=1024,OSL=1024,TP=<tp>,PP=<pp>,CONC=<concurrency>
 ```
 
-`<tp>` is the config's own `params.tensor_parallelism` (4 or 8).
+The TP and PP in every key must match `server_params.tensor_parallel_size` and
+`server_params.pipeline_parallel_size`, including `PP=1` for single-node
+configs. Cell values override `benchmark_params`.
 
-`random_range_ratio` is `0.0` so ISL/OSL are exact rather than jittered ±80%.
+`benchmark_params.random_range_ratio` is `0.0` so ISL/OSL are exact rather
+than jittered ±80%.
+
+When `server_params.max_model_len` is absent, CVS derives one from each
+cell's effective benchmark settings after sweep overrides:
+
+```text
+ceil((ISL + OSL) * (1 + random_range_ratio)) + random_prefix_len + 8
+```
+
+With the catalog's zero ratio and prefix, 1024/1024 derives `2056`, while
+1024/8192 and 8192/1024 both derive `9224`. An explicit non-null
+`server_params.max_model_len` overrides the fallback and emits exactly one
+`--max-model-len` flag. Explicit null intentionally emits no flag and
+suppresses the fallback, allowing the vLLM/model default. Because the option is
+part of the server identity, different derived values restart the server;
+equal derived values reuse it. Explicit null also permits reuse across
+different ISL/OSL cells when all other server arguments match.
 
 `num_prompts` is **320**, not the `3200` schema default used by the configs in
 `cvs/input/config_file/inference/vllm/`. That makes each cell a characterization
 pass — enough to shake out topology, AITER and kv-cache settings on new
 hardware, at roughly a tenth the wall-clock. Raise it to `3200` before quoting
 numbers that need to line up with the shipped examples.
+
+## Image- and model-scoped AITER environment
+
+The catalog AITER settings are validated for vLLM commit `4bdc8a788` and live
+in `container.env`:
+
+- DeepSeek V4 Flash, DeepSeek V4 Pro, GLM 5.1, and GLM 5.2 set
+  `VLLM_ROCM_USE_AITER=1`, `VLLM_ROCM_USE_AITER_MHA=0`, and
+  `GPU_ARCHS=gfx942`.
+- Kimi K2.5 sets `VLLM_ROCM_USE_AITER=1` and disables
+  `VLLM_ROCM_USE_AITER_MHA`, `VLLM_ROCM_USE_AITER_FP4BMM`,
+  `VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS`, and
+  `VLLM_ROCM_USE_AITER_MLA`.
+- The other packaged model families carry no AITER overrides.
+
+Do not add `VLLM_USE_AITER_UNIFIED_ATTENTION` or
+`VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4`; this image does not register them, so
+they are warning-only and ignored. Do not substitute
+`VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION` or other attention-backend variables
+without validating both registration and call sites in the exact image.
 
 ## Thresholds
 
@@ -96,9 +124,9 @@ measured values from a calibration run before flipping `enforce_thresholds`.
 Accuracy is split across the two files, unlike the three families above:
 
 - **`config.json` → `accuracy.tasks`** selects *which* lm-eval tasks run.
-  Shipped empty, so no accuracy stage runs and the pytest node is auto-skipped.
+  Packaged configs omit this optional block, so no accuracy stage runs.
 - **`threshold.json` → `accuracy`** holds the gating values, keyed by task id
-  then by lm-eval metric key. Shipped as `{}`.
+  then by lm-eval metric key. Add it when configuring accuracy tasks.
 
 Because the threshold keys are derived from the task ids you choose, they
 cannot be pre-enumerated the way `client.*`/`gpu.*`/`prom.*` can — the two
@@ -122,15 +150,18 @@ Every environment-specific value is redacted. Per config:
 
 | Field | What to set |
 |---|---|
-| `model.id` | Local model path (e.g. `/models/GLM-5.1-FP8`) or an HF repo id |
+| `server_params.model` | Local model path (e.g. `/models/GLM-5.1-FP8`) |
 | `container.image` | The vLLM/ROCm image tag under test |
 | `container.runtime.args.volumes[1]` | Replace `<changeme-models-mount>` with the host models directory |
-| `roles.server.ib_netdev` | *(distributed only)* socket interface name for `NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` / `TP_SOCKET_IFNAME`. Must be **UP and hold a routable IPv4 reaching the other node** — check `ip -o -4 addr show`, not just `ip -o link show`. An interface that exists but is DOWN/addressless fails engine init with gloo `Unable to find address for: <name>` |
-| `params.master_addr` | *(distributed only)* head node IP |
+| `container.env.NCCL_IB_HCA` | *(distributed only)* fixed RDMA devices. The packaged MI3xx configs use `rdma0` through `rdma7`; change the value if your nodes expose different HCA names. |
+| `container.env.NCCL_SOCKET_IFNAME` | *(distributed only)* replace `<changeme>` with the Linux netdev associated with the selected RNICs. |
+| `container.env.GLOO_SOCKET_IFNAME`, `TP_SOCKET_IFNAME` | *(distributed only)* replace `<changeme>` with the frontend/control-plane interface in the usual deployment. The selected interface must be **UP and hold a routable IPv4 reaching the other node** — check `ip -o -4 addr show`, not just `ip -o link show`. |
+| `container.env.NCCL_IB_GID_INDEX` | *(distributed only)* run `show_gids` inside the container and choose the index for the intended RoCE/IB fabric that exists on every selected HCA and node. If `show_gids` is unavailable, inspect `ibv_devinfo -v` and `/sys/class/infiniband/<hca>/ports/<port>/gid_attrs/`. |
 
 `paths.models_dir` is `/models`, the in-container mount point — it is exported
-as `HF_HUB_CACHE`. When `model.id` is an absolute path under `/models`, vLLM
-loads straight from the mount and no download occurs.
+as `HF_HUB_CACHE`. When `server_params.model` is an absolute path under `/models`, vLLM
+loads straight from the mount and no download occurs. CVS derives the
+distributed rendezvous address from the cluster head.
 
 ## Workload set
 
@@ -151,9 +182,10 @@ loads straight from the mount and no download occurs.
 | `deepseek-r1-0528_fp8` | DeepSeek R1 0528 FP8 PTPC | |
 | `gpt-oss-120b_mxfp4` | GPT-OSS 120B MXFP4 | |
 
-Models with a custom tokenizer or modelling code set `trust-remote-code: true`;
-the suite mirrors that flag onto the bench client so it can load the same
-tokenizer.
+Server options live directly under `server_params` as snake-case vLLM options:
+`gpu_memory_utilization` becomes `--gpu-memory-utilization`. Benchmark options
+live under `benchmark_params`; `trust_remote_code` is set independently there
+when the bench client needs it.
 
 ## Running
 

@@ -82,36 +82,30 @@ A vLLM configuration file has these top-level keys:
    * - Key
      - Required
      - Description
-   * - ``schema_version``
-     - yes
-     - Must be ``1``
-   * - ``framework``
-     - yes
-     - Must be ``"vllm"``
    * - ``enforce_thresholds``
      - no (default ``true``)
-     - When ``false``, threshold failures and coverage gaps become warnings
+     - When ``false``, metrics record without requiring calibrated threshold cells
    * - ``threshold_json``
-     - no
+     - yes
      - Explicit path to the threshold file. See :ref:`vllm-threshold-discovery`
    * - ``container``
-     - no
+     - yes
      - Container/Docker settings. See :ref:`vllm-container`
    * - ``paths``
      - yes
      - Filesystem locations. See :ref:`vllm-paths`
-   * - ``model``
+   * - ``server_params``
      - yes
-     - Model identifier. See :ref:`vllm-model`
-   * - ``roles``
+     - Harness-owned server fields plus snake-case ``vllm serve`` options
+   * - ``benchmark_params``
+     - no
+     - Benchmark defaults plus snake-case ``vllm bench serve`` options
+   * - ``sweeps``
      - yes
-     - Server arguments and environment. See :ref:`vllm-roles`
-   * - ``params``
+     - Canonical run-cell keys mapped to benchmark overrides
+   * - ``runs``
      - yes
-     - Client and topology parameters. See :ref:`vllm-params`
-   * - ``sweep``
-     - yes
-     - Sequence combinations and runs. See :ref:`vllm-sweep`
+     - Nonempty ordered list of the sweep cells to execute
    * - ``thresholds``
      - no
      - Per-cell pass/fail specs. See :ref:`vllm-thresholds`
@@ -121,7 +115,12 @@ A vLLM configuration file has these top-level keys:
 
 .. important::
 
-  Every block except ``container`` **forbids unknown keys**. A misspelled key is a hard validation error at load time, not a silently ignored setting. The ``container`` block is permissive because it passes ``runtime`` and other keys through to the orchestrator untouched.
+  Top-level and structural blocks **forbid unknown keys**. ``server_params``,
+  ``benchmark_params``, and individual sweep overrides deliberately accept
+  arbitrary snake-case vLLM option names. CVS converts them to kebab-case CLI
+  flags. ``null`` omits a flag, ``true`` emits a bare flag, scalars emit one
+  value, lists emit one flag followed by values, and mappings emit compact JSON.
+  Use an option's negative form instead of ``false``.
 
 Placeholder substitution
 ------------------------
@@ -164,14 +163,14 @@ Four different things in this stack are called a "backend". They are unrelated, 
    * - Setting
      - Values
      - What it selects
-   * - ``params.backend``
+   * - ``benchmark_params.backend``
      - ``"vllm"`` (default)
      - The **client** backend passed to ``vllm bench serve --backend``. Nothing to do with distribution
-   * - ``roles.server.serve_args.``\ ``distributed-executor-backend``
+   * - ``server_params.distributed_executor_backend``
      - ``"mp"`` (default), ``"ray"``
      - How vLLM distributes the model across nodes. This is the multinode setting
    * - ``container.runtime.name``
-     - ``"docker"`` (default), ``"enroot"``
+     - ``"docker"``
      - The container runtime
    * - Cluster file ``orchestrator``
      - ``"baremetal"``, ``"container"``
@@ -186,7 +185,7 @@ Distributed executor: mp and ray
 
 Multinode runs support **two** executor backends. ``mp`` is the default and requires no configuration key at all.
 
-**mp (default).** Used whenever ``distributed-executor-backend`` is absent from ``serve_args``. The suite injects the full distributed block into each rank's ``vllm serve`` command:
+**mp (default).** Used whenever ``server_params.distributed_executor_backend`` is absent. The suite injects the full distributed block into each rank's ``vllm serve`` command:
 
 .. code:: bash
 
@@ -197,14 +196,14 @@ Multinode runs support **two** executor backends. ``mp`` is the default and requ
 
 Every rank above 0 additionally gets ``--headless``. This path **requires pipeline parallelism** (``pipeline_parallel_size`` greater than 1).
 
-**ray (opt-in).** Selected by setting ``distributed-executor-backend`` to the exact lowercase string ``"ray"``. Any other spelling, including ``"Ray"``, falls back to the mp path. Ray takes a completely different route:
+**ray (opt-in).** Selected by setting ``server_params.distributed_executor_backend`` to the exact lowercase string ``"ray"``. Other values are configuration errors. Ray takes a completely different route:
 
 1. Bootstrap the cluster head: ``ray start --head --port=<master_port>``
-2. Bootstrap each worker: ``ray start --address=<master_addr>:<master_port>``
+2. Bootstrap each worker: ``ray start --address=<cluster-head>:<dist_init_port>``
 3. Launch ``vllm serve`` on the **head node only** — workers run no serve process
 4. On teardown, broadcast ``ray stop`` after the process kill
 
-Under ray, none of the mp distributed flags are emitted; the backend flag reaches vLLM through normal ``serve_args`` flattening. ``--pipeline-parallel-size`` is added only when ``pipeline_parallel_size`` is greater than 1.
+Under ray, none of the mp distributed flags are emitted. ``--pipeline-parallel-size`` is added only when ``server_params.pipeline_parallel_size`` is greater than 1.
 
 .. note::
 
@@ -230,7 +229,7 @@ These rules are enforced when the configuration file loads, before anything star
    * - ``pipeline_parallel_size`` > 1
      - The distributed suite requires more than one cluster host
    * - exactly two cluster hosts, either backend
-     - ``roles.server.ib_netdev`` is **required**; larger clusters are rejected until a dedicated recipe exists
+     - ``container.env.NCCL_SOCKET_IFNAME`` is **required**; larger clusters are rejected until a dedicated recipe exists
 
 The corresponding error messages are:
 
@@ -238,19 +237,18 @@ The corresponding error messages are:
 
   multi-host distributed execution requires pipeline_parallel_size > 1 unless using ray
   pipeline_parallel_size > 1 requires a multi-host distributed suite
-  ib_netdev is required for multi-host distributed execution. Set it to the Linux
-  network interface name for NCCL_SOCKET_IFNAME (e.g. "ens51f1np1"). Cannot be
-  auto-derived from HCA names.
+  vllm_distributed requires container.env.NCCL_SOCKET_IFNAME on multi-host clusters
 
 Multinode prerequisites
 -----------------------
 
 Beyond the validation rules, a multinode run needs:
 
-- ``params.master_addr`` — the head node's address, reachable from every worker.
-- ``params.master_port`` — default ``"29501"``.
-- ``roles.server.ib_netdev`` — the Linux interface name. There is deliberately no ``"auto"`` value; it cannot be derived reliably from HCA names. This value populates ``NCCL_SOCKET_IFNAME``, ``GLOO_SOCKET_IFNAME``, and ``TP_SOCKET_IFNAME``.
-- ``roles.server.ib_hca_devices`` — ``"auto"``, an explicit list, or ``null``. When set, populates ``NCCL_IB_HCA``.
+- ``server_params.dist_init_port`` — default ``29501``; CVS derives the head address from the cluster.
+- ``container.env.NCCL_IB_HCA`` — the comma-separated RDMA HCA names available on every node. The packaged MI3xx configurations set ``rdma0`` through ``rdma7``.
+- ``container.env.NCCL_SOCKET_IFNAME`` — the Linux netdev associated with the selected RNICs.
+- ``container.env.GLOO_SOCKET_IFNAME`` and ``TP_SOCKET_IFNAME`` — generally the frontend/control-plane interface.
+- ``container.env.NCCL_IB_GID_INDEX`` — the index for the intended RoCE/IB fabric. Use ``show_gids`` inside the container and choose an entry available on every selected HCA and node. If that command is unavailable, inspect ``ibv_devinfo -v`` and ``/sys/class/infiniband/<hca>/ports/<port>/gid_attrs/``.
 
 .. _vllm-container:
 
@@ -468,7 +466,8 @@ All four keys are required.
    * - ``hf_token_file``
      - Path to a file containing the Hugging Face token
 
-If ``hf_token_file`` does not exist and the model is pre-staged (``model.remote`` of 0), the run continues with an empty token and the server sets ``HF_HUB_OFFLINE=1``. If the model is remote, the suite skips instead.
+If ``hf_token_file`` does not exist, the run continues with an empty token. vLLM
+configs always serve a pre-staged model mounted under ``paths.models_dir``.
 
 Per-cell artifacts land in::
 
@@ -489,23 +488,19 @@ Model
    * - Key
      - Default
      - Description
-   * - ``id``
+   * - ``server_params.model``
      - none
-     - Hugging Face model ID or local path, for example ``amd/Llama-3.1-70B-Instruct-FP8-KV``
-   * - ``remote``
-     - none
-     - ``0`` for a pre-staged model
-
-.. important::
-
-  ``remote: 1`` is **not implemented** and raises ``NotImplementedError`` at load time. Stage weights under ``paths.models_dir`` and use ``remote: 0``.
+     - Local path, for example ``/models/Llama-3.1-70B-Instruct-FP8-KV``
 
 .. _vllm-roles:
 
 Server role
 ===========
 
-``roles.server`` controls the ``vllm serve`` process.
+``server_params`` controls the ``vllm serve`` process. Harness-owned fields
+are ``model``, ``tensor_parallel_size``, ``pipeline_parallel_size``, ``port``,
+``dist_init_port``, polling controls, and ``distributed_executor_backend``.
+Every other snake-case key is passed through to ``vllm serve``.
 
 .. list-table::
    :widths: 3 2 5
@@ -514,18 +509,18 @@ Server role
    * - Key
      - Default
      - Description
-   * - ``serve_args``
-     - ``{}``
-     - Flags passed through to ``vllm serve``
-   * - ``env``
-     - ``{}``
-     - Environment for the server process and the benchmark client
-   * - ``ib_hca_devices``
-     - ``null``
-     - ``"auto"``, an explicit list, or ``null``; sets ``NCCL_IB_HCA``
-   * - ``ib_netdev``
-     - ``null``
-     - Interface name; required for multi-host distributed execution
+   * - ``model``
+     - none
+     - Local model path supplied as the positional ``vllm serve`` argument
+   * - ``tensor_parallel_size``
+     - none
+     - Tensor-parallel degree
+   * - ``pipeline_parallel_size``
+     - ``1``
+     - Pipeline-parallel degree
+   * - ``port``
+     - ``8888``
+     - OpenAI-compatible server port
 
 How serve_args are flattened
 ----------------------------
@@ -539,29 +534,28 @@ How serve_args are flattened
      - Example
    * - Scalar
      - ``--flag value``
-     - ``"kv-cache-dtype": "fp8"`` → ``--kv-cache-dtype fp8``
+     - ``"kv_cache_dtype": "fp8"`` → ``--kv-cache-dtype fp8``
    * - ``true``
      - ``--flag`` (bare)
-     - ``"enforce-eager": true`` → ``--enforce-eager``
+     - ``"enforce_eager": true`` → ``--enforce-eager``
    * - ``false``
-     - nothing
-     - ``"enforce-eager": false`` → omitted entirely
+     - rejected
+     - Omit the setting or use vLLM's explicit negative option
    * - List
-     - flag repeated per element
-     - ``"x": ["a","b"]`` → ``--x a --x b``
+     - one flag followed by its values
+     - ``"x": ["a","b"]`` → ``--x a b``
 
-``serve_args.log-level``, if set, must be one of ``debug``, ``info``, ``warning``, ``error``, ``critical``.
-
-Derived max-model-len
----------------------
-
-``--max-model-len`` is computed and emitted **only when** ``serve_args`` does not already set ``max-model-len``:
+When ``server_params.max_model_len`` is absent, CVS derives one for each
+benchmark cell from its effective parameters after sweep overrides:
 
 .. code:: text
 
-  ceil((isl + osl) * (1 + random_range_ratio)) + random_prefix_len + 8
+  ceil((ISL + OSL) * (1 + random_range_ratio)) + random_prefix_len + 8
 
-Setting ``max-model-len`` explicitly in ``serve_args`` suppresses the derived value, so the flag never appears twice.
+An explicit non-null ``server_params.max_model_len`` takes precedence and
+emits exactly one ``--max-model-len`` flag. An explicit null value is an
+intentional opt-out: the generic option serializer emits no flag, and CVS
+suppresses the fallback so vLLM uses the model or image default.
 
 Environment variables: two mechanisms
 -------------------------------------
@@ -574,38 +568,59 @@ These are separate and are frequently confused.
 
    * -
      - ``container.env``
-     - ``roles.server.env``
+     - generated per-command environment
    * - Applied by
      - ``docker run -e``
-     - A sourced shell script inside the container
+     - A sourced shell script inside the container after HCA discovery
    * - Scope
      - Every command in the container, for its whole lifetime
-     - The ``vllm serve`` processes and the benchmark client
+     - Hugging Face path/token variables and legacy network fallbacks
    * - Changing it
      - Requires recreating the container
-     - Takes effect on the next run
+     - Takes effect on the next command
    * - Defaults
      - ``GPUS=8``, ``MULTINODE=true``
-     - See below
+     - No network overrides unless a legacy top-level field is set
 
-The server environment script always exports:
+The generated per-command environment always exports:
 
 .. code:: bash
 
   export HF_TOKEN=<token>
   export HF_HUB_CACHE=<paths.models_dir>
-  export VLLM_USE_AITER_UNIFIED_ATTENTION=1
-  export VLLM_ROCM_USE_AITER_MHA=0
-  export VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4=1
+Packaged configurations set the HCA, socket-interface, GID, and NCCL debug
+settings in ``container.env`` so every command inherits them and topology
+discovery does not overwrite them. The legacy top-level ``ib_hca_devices`` and
+``ib_netdev`` fields remain fallbacks for external configurations that omit
+their corresponding container environment variables. Put other static ROCm,
+NCCL, and vLLM exports in ``container.env``.
 
-then, conditionally, ``NCCL_IB_HCA`` (from ``ib_hca_devices``) and ``NCCL_SOCKET_IFNAME`` / ``GLOO_SOCKET_IFNAME`` / ``TP_SOCKET_IFNAME`` (from ``ib_netdev``). Entries from ``roles.server.env`` are appended **last**, so they override any of the above.
+The packaged MI3xx catalog's AITER settings are image- and model-scoped. For
+the image based on vLLM commit ``4bdc8a788``:
+
+- DeepSeek V4 Flash, DeepSeek V4 Pro, GLM 5.1, and GLM 5.2 set
+  ``VLLM_ROCM_USE_AITER=1``, ``VLLM_ROCM_USE_AITER_MHA=0``, and
+  ``GPU_ARCHS=gfx942``.
+- Kimi K2.5 sets ``VLLM_ROCM_USE_AITER=1`` and disables
+  ``VLLM_ROCM_USE_AITER_MHA``, ``VLLM_ROCM_USE_AITER_FP4BMM``,
+  ``VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS``, and
+  ``VLLM_ROCM_USE_AITER_MLA``.
+- Other packaged model families carry no AITER overrides.
+
+Do not add ``VLLM_USE_AITER_UNIFIED_ATTENTION`` or
+``VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4``: this image does not register them, so
+they are warning-only and ignored. Do not substitute
+``VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION`` or other attention-backend variables
+without validating both registration and call sites in the exact image.
 
 .. _vllm-params:
 
-Parameters
-==========
+Benchmark parameters
+====================
 
-``params`` holds client knobs and distributed-service settings. The cluster file determines host count.
+``benchmark_params`` holds client defaults. Per-cell entries in ``sweeps``
+override these values. CVS owns endpoint construction, result paths, and
+percentile reporting.
 
 .. list-table::
    :widths: 3 2 5
@@ -620,9 +635,9 @@ Parameters
    * - ``base_url``
      - ``"http://0.0.0.0"``
      - Server base URL
-   * - ``port_no``
-     - ``"8888"``
-     - Server port
+   * - ``num_prompts``
+     - ``3200``
+     - Total prompts per cell
    * - ``dataset_name``
      - ``"random"``
      - Dataset for the load generator
@@ -639,63 +654,43 @@ Parameters
      - ``"inf"``
      - Arrival rate; ``inf`` sends as fast as concurrency allows
    * - ``random_range_ratio``
-     - ``"0.8"``
+     - ``"0.0"``
      - Length jitter around ISL/OSL; also feeds the derived max-model-len
    * - ``random_prefix_len``
      - ``"0"``
      - Shared prefix length
-   * - ``tensor_parallelism``
-     - ``"8"``
-     - TP degree
-   * - ``pipeline_parallel_size``
-     - ``"1"``
-     - PP degree; see :ref:`vllm-backends`
-   * - ``master_addr``
-     - ``"localhost"``
-     - Head node address for multinode
-   * - ``master_port``
-     - ``"29501"``
-     - Rendezvous port
    * - ``tokenizer_mode``
      - ``"auto"``
      - Tokenizer mode
-   * - ``percentile_metrics``
-     - ``"ttft,tpot,itl,e2el"``
-     - Metric families to compute percentiles for
-   * - ``metric_percentiles``
-     - ``"50,90,95,99"``
-     - Percentiles to emit
-   * - ``client_poll_count``
-     - ``"20"``
+   * - ``client_poll_iterations``
+     - ``20``
      - Client completion polls before giving up
 
 .. tip::
 
-  ``metric_percentiles`` must emit every percentile your thresholds gate. The default ``"50,90,95,99"`` covers all gated latency metrics. Narrowing it to ``"99"`` makes p50/p90/p95 unavailable, and any threshold on them then fails loudly.
+  Arbitrary snake-case keys under ``benchmark_params`` and a cell override are
+  translated to ``vllm bench serve`` options. They cannot override model,
+  endpoint, sequence lengths, concurrency, result paths, or harness-owned
+  percentile reporting.
 
 .. _vllm-sweep:
 
 Sweep
 =====
 
-The sweep is an explicit list of runs, not a cartesian product. Named sequence combinations are declared once, then referenced by the runs list.
+The sweep is an explicit list of canonical cells, not a cartesian product.
+``sweeps`` defines optional overrides and ``runs`` selects the cells to execute.
 
 .. code:: json
 
     {
-      "sweep": {
-        "sequence_combinations": [
-          {
-            "name": "balanced",
-            "isl": "1000",
-            "osl": "1000",
-            "goodput_slo": { "ttft_ms": 2000.0, "tpot_ms": 50.0, "e2el_ms": 60000.0 }
-          }
-        ],
-        "runs": [
-          { "combo": "balanced", "concurrency": 16 },
-          { "combo": "balanced", "concurrency": 32 }
-        ]
+      "sweeps": {
+        "ISL=1000,OSL=1000,TP=8,PP=2,CONC=16": { "num_prompts": 50 },
+        "ISL=1000,OSL=1000,TP=8,PP=2,CONC=32": {}
+      },
+      "runs": [
+        "ISL=1000,OSL=1000,TP=8,PP=2,CONC=16",
+        "ISL=1000,OSL=1000,TP=8,PP=2,CONC=32"
       }
     }
 
@@ -705,22 +700,13 @@ The sweep is an explicit list of runs, not a cartesian product. Named sequence c
 
    * - Key
      - Description
-   * - ``sequence_combinations[].name``
-     - Unique label; duplicates are rejected
-   * - ``sequence_combinations[].isl``
-     - Input sequence length
-   * - ``sequence_combinations[].osl``
-     - Output sequence length
-   * - ``sequence_combinations[].goodput_slo``
-     - Optional; ``ttft_ms``, ``tpot_ms``, ``e2el_ms``, all required together
-   * - ``runs[].combo``
-     - Must name a declared combination
-   * - ``runs[].concurrency``
-     - Integer max concurrency for this cell
+   * - ``sweeps.<cell>``
+     - Per-cell benchmark override object
+   * - ``runs[]``
+     - Canonical key declared in ``sweeps``
 
-A ``combo`` that names no declared combination is a load-time error listing the known names.
-
-When ``goodput_slo`` is set, the client is invoked with ``--goodput ttft:<v> tpot:<v> e2el:<v>`` and ``client.goodput`` becomes meaningful.
+An undeclared, malformed, duplicated, or TP/PP-inconsistent cell key is a
+load-time error.
 
 Cell keys
 ---------
@@ -729,20 +715,29 @@ Each run is one **cell**, identified by a canonical key used to look up threshol
 
 .. code:: text
 
-  Single-node:  ISL=<isl>,OSL=<osl>,TP=<tp>,CONC=<conc>
-  Distributed:  ISL=<isl>,OSL=<osl>,TP=<tp>,PP=<pp>,CONC=<conc>
+  ISL=<isl>,OSL=<osl>,TP=<tp>,PP=<pp>,CONC=<conc>
 
-``PP=`` appears for multi-host distributed execution, including Ray runs with
-``PP=1``. The host count is placement information, not a threshold dimension.
+``PP=`` is always present, including single-node and Ray runs with ``PP=1``.
+The host count is placement information, not a threshold dimension.
 Examples::
 
-  ISL=1000,OSL=1000,TP=8,CONC=16
+  ISL=1000,OSL=1000,TP=8,PP=1,CONC=16
   ISL=1000,OSL=1000,TP=8,PP=2,CONC=16
 
 Server reuse
 ------------
 
-Cells that differ **only** in concurrency share a server identity, so the suite reuses the running server instead of stopping it, restarting, and reloading weights. Changing ISL, OSL, TP, PP, or any server argument forces a restart. Ordering runs so that concurrency varies fastest therefore makes a sweep substantially quicker.
+Cells with identical server arguments share a server identity, so the suite
+reuses the running server instead of stopping it, restarting, and reloading
+weights. The derived ``--max-model-len`` is part of that identity: different
+derived values force a restart, while cells with equal derived values reuse the
+server. For example, with zero range ratio and prefix, 1024/8192 and 8192/1024
+both derive ``9224`` and can share. An explicit
+non-null ``server_params.max_model_len`` can also allow different ISL/OSL
+cells to share. Explicit null removes the max-model-len option from the server
+identity entirely, so different ISL/OSL cells share when their other server
+arguments match. Concurrency remains client-only, so ordering runs with
+concurrency varying fastest makes a sweep substantially quicker.
 
 .. _vllm-thresholds:
 
@@ -803,13 +798,17 @@ For ``min_ratio``, the ``reference`` names another metric in the same cell. If t
 Coverage checking
 -----------------
 
-At load time the threshold file is checked on one axis: **cell coverage**. Every sweep cell must have a threshold entry, and no threshold key may name a cell that the sweep does not produce. This catches keys left behind after a sweep edit.
+At load time, every threshold cell must name a key in ``sweeps``. When
+``enforce_thresholds`` is true, every selected ``runs`` cell must have a
+threshold entry. Record-only runs may select uncalibrated cells.
 
 There is no per-metric coverage requirement. A cell's entry may spec a single metric or two dozen — a threshold file is free to gate only the metrics you care about rather than every member of every family.
 
 The ``accuracy`` key is exempt from cell-coverage checking, since it is keyed by task rather than by cell.
 
-Setting ``enforce_thresholds`` to ``false`` downgrades coverage problems to warnings and stops threshold violations from failing tests. The run still measures and records everything, which makes it the right setting for a first calibration run on new hardware.
+Setting ``enforce_thresholds`` to ``false`` stops threshold violations from
+failing tests. The run still measures and records everything, which makes it
+the right setting for a first calibration run on new hardware.
 
 Which metrics are asserted is then decided per metric at evaluation time, not at load time. A metric is checked only when its cell carries a spec for it; with no spec it is measured and reported but never asserted. A spec of ``null`` is the explicit way to say the same thing.
 
@@ -1085,10 +1084,15 @@ Accuracy evaluation runs `lm-evaluation-harness <https://github.com/EleutherAI/l
         "tasks": [
           {
             "id": "gsm8k_strict",
-            "task": "gsm8k",
+            "tasks": "gsm8k",
+            "backend": "vllm",
+            "lm_eval_model": "local-completions",
             "num_fewshot": 5,
+            "batch_size": "auto",
+            "limit": 100,
             "num_concurrent": 8,
-            "apply_chat_template": false
+            "exec_timeout_sec": 7200,
+            "extra_model_args": "tokenizer_backend=huggingface"
           }
         ]
       }
@@ -1104,18 +1108,21 @@ Accuracy evaluation runs `lm-evaluation-harness <https://github.com/EleutherAI/l
    * - ``id``
      - none
      - Unique label for this entry; duplicates are rejected
-   * - ``task``
+   * - ``tasks`` (or legacy ``task``)
      - none
-     - lm-eval task name
+     - lm-eval task name or task list
+   * - ``lm_eval_model``
+     - endpoint-derived
+     - ``local-completions`` or ``local-chat-completions``
    * - ``num_fewshot``
-     - ``0``
-     - Few-shot example count
+     - lm-eval default
+     - Few-shot example count, if explicitly set
    * - ``num_concurrent``
      - ``8``
      - Concurrent requests
    * - ``apply_chat_template``
      - ``false``
-     - Selects the endpoint; see below
+     - Enables or names the chat template
    * - ``metadata``
      - ``{}``
      - Passed through to lm-eval
@@ -1126,7 +1133,8 @@ Accuracy evaluation runs `lm-evaluation-harness <https://github.com/EleutherAI/l
      - ``{}``
      - Generation arguments
 
-``apply_chat_template`` selects the API surface:
+``lm_eval_model`` selects the API surface. If omitted, CVS derives it from
+``apply_chat_template``:
 
 .. list-table::
    :widths: 2 3 4
@@ -1142,7 +1150,14 @@ Accuracy evaluation runs `lm-evaluation-harness <https://github.com/EleutherAI/l
      - ``local-chat-completions``
      - ``/v1/chat/completions``
 
-lm-eval is probed for at run time and installed into the container if absent. Each task has a four-hour timeout. Results land under ``<log_dir>/accuracy``.
+CVS pins runtime installation to ``lm-eval[api,math]==0.4.12``. The shared
+accuracy schema also exposes that release's evaluation controls, including
+``batch_size``, ``max_batch_size``, ``device``, ``limit``, ``samples``,
+``use_cache``, ``cache_requests``, ``check_integrity``,
+``system_instruction``, ``fewshot_as_multiturn``, ``predict_only``, ``seed``,
+``trust_remote_code``, ``confirm_run_unsafe_code``, ``metadata``, and
+``gen_kwargs``. CVS owns the endpoint, model path, output path, and sample
+logging. Results land under ``<log_dir>/accuracy``.
 
 Accuracy metric keys
 --------------------
@@ -1182,8 +1197,8 @@ Troubleshooting
      - Multi-host ``vllm_distributed`` on the mp backend needs pipeline parallelism. Either raise ``pipeline_parallel_size``, or set ``distributed-executor-backend`` to ``"ray"``
    * - ``vllm_single requires pipeline_parallel_size=1``
      - Use ``vllm_distributed`` when the config requires pipeline parallelism
-   * - ``vllm_distributed requires roles.server.ib_netdev``
-     - Set ``roles.server.ib_netdev`` to the interface name. There is no ``"auto"``
+   * - ``vllm_distributed requires container.env.NCCL_SOCKET_IFNAME``
+     - Set all three socket-interface variables under ``container.env``
    * - ``Container image not specified in config``
      - ``container.image`` is empty. Note that a variant ``container`` block with no ``image`` overwrites the cluster file's value
    * - ``duplicate sequence_combination names``

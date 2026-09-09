@@ -19,6 +19,12 @@ class EffectiveVllmTopology:
         return (self.hosts,)
 
 
+def _socket_netdev_configured(variant):
+    container = getattr(variant, "container", None)
+    env = getattr(container, "env", {}) if container is not None else {}
+    return bool(env.get("NCCL_SOCKET_IFNAME") or getattr(variant, "ib_netdev", None))
+
+
 def scope_vllm_cluster(mode, cluster):
     """Return the cluster used by the selected suite.
 
@@ -53,7 +59,7 @@ def resolve_vllm_topology(mode, variant, hosts) -> EffectiveVllmTopology:
         raise ValueError("vLLM requires at least one orchestrator host")
 
     if mode == "single":
-        if int(variant.params.pipeline_parallel_size) > 1:
+        if variant.server_params.pipeline_parallel_size > 1:
             raise ValueError("vllm_single requires pipeline_parallel_size=1")
         if len(hosts) != 1:
             raise ValueError("vllm_single orchestrator must be scoped to its first host")
@@ -68,12 +74,12 @@ def resolve_vllm_topology(mode, variant, hosts) -> EffectiveVllmTopology:
             "add an explicit N-host recipe and thresholds before using a larger cluster"
         )
 
-    is_ray = variant.roles.server.serve_args.get("distributed-executor-backend") == "ray"
-    effective_pp = int(variant.params.pipeline_parallel_size)
+    is_ray = variant.server_params.distributed_executor_backend == "ray"
+    effective_pp = variant.server_params.pipeline_parallel_size
     if effective_pp == 1 and not is_ray:
         raise ValueError("vllm_distributed requires pipeline_parallel_size>1 unless distributed-executor-backend=ray")
-    if not variant.roles.server.ib_netdev:
-        raise ValueError("vllm_distributed requires roles.server.ib_netdev on multi-host clusters")
+    if not _socket_netdev_configured(variant):
+        raise ValueError("vllm_distributed requires container.env.NCCL_SOCKET_IFNAME on multi-host clusters")
     return EffectiveVllmTopology("distributed", hosts, effective_pp)
 
 
