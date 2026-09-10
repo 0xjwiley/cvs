@@ -141,7 +141,9 @@ class TestLaunchContainerGpuAccess(unittest.TestCase):
         self.assertEqual(self._launch()["user"], "root")
 
     def test_render_group_is_added_when_present_on_host(self):
-        self.assertEqual(self._launch()["group_add"], ["video", "render"])
+        # Docker resolves group_add names against the *container image's* /etc/group,
+        # not the host's, so the host's numeric GID must be passed instead of "render".
+        self.assertEqual(self._launch()["group_add"], ["video", "104"])
 
     def test_render_group_is_skipped_when_absent_on_host(self):
         # containers.run() fails outright if a requested group is missing on the

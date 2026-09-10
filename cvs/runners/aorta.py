@@ -278,8 +278,12 @@ class AortaRunner(BaseRunner):
         Resolve the container's group_add list for GPU device access on `node`.
 
         "video" exists on essentially every distro. "render" does not (e.g. some
-        minimal/older images), and containers.run() fails outright if a requested
-        group is missing on the host, so probe for it over SSH before requesting it.
+        minimal/older images), so probe for it over SSH before requesting it. Docker
+        resolves a group_add name against the *container image's* /etc/group, not the
+        host's, so a name found on the host (e.g. "render") can fail to resolve inside
+        the image even though the host device node needs that host GID. Pass the
+        numeric GID instead so it's applied directly, independent of the image's group
+        database.
         """
         groups = ["video"]
         try:
@@ -298,10 +302,11 @@ class AortaRunner(BaseRunner):
                 timeout=15,
             )
             if result.returncode == 0 and result.stdout.strip():
-                groups.append("render")
+                gid = result.stdout.strip().split(":")[2]
+                groups.append(gid)
             else:
                 log.debug(f"No 'render' group on {node}; launching with group_add={groups}")
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        except (subprocess.TimeoutExpired, FileNotFoundError, IndexError) as e:
             log.debug(f"Could not check for 'render' group on {node}: {e}")
         return groups
 
