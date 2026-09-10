@@ -458,6 +458,55 @@ class TestSetupSingleNodeCancelledLate(unittest.TestCase):
 
 
 class TestRunPartialNodeFailureStillCollectsTraces(unittest.TestCase):
+    def test_rejected_old_traces_are_not_restored_by_discovery_or_legacy_fallback(self):
+        for output_name in ("previous_run", "nodes1_rccl_develop_commsCh112_computeCh144"):
+            with self.subTest(output_name=output_name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                trace = root / output_name / "torch_profiler" / "rank0" / "trace.json"
+                trace.parent.mkdir(parents=True)
+                trace.write_text("{}")
+                os.utime(trace, (1, 1))
+                runner = _make_runner(nodes=["head", "worker"], aorta_path=root)
+
+                with (
+                    patch.object(
+                        runner,
+                        "_run_single_node",
+                        side_effect=lambda *, node, **kw: (node, 1, "failed before profiling"),
+                    ),
+                    patch.object(runner, "_pick_master_port", return_value=29500),
+                    patch.object(runner, "_copy_remote_torch_profilers", return_value=False),
+                ):
+                    result = runner.run()
+
+                self.assertEqual(result.status, RunStatus.FAILED)
+                self.assertIsNone(result.get_artifact("torch_traces"))
+                self.assertEqual(list((root / "combined_traces").rglob("*.json")), [])
+
+    def test_combined_artifact_is_not_replaced_by_a_newer_single_node_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            combined = root / "combined_traces"
+            for rank in (0, 8):
+                trace = combined / f"node_{rank // 8}" / "torch_profiler" / f"rank{rank}" / "trace.json"
+                trace.parent.mkdir(parents=True)
+                trace.write_text("{}")
+                os.utime(trace, (100, 100))
+            source = root / "output" / "torch_profiler" / "rank0" / "trace.json"
+            source.parent.mkdir(parents=True)
+            source.write_text("{}")
+            os.utime(source, (200, 200))
+            runner = _make_runner(nodes=["head", "worker"], aorta_path=root)
+
+            with (
+                patch.object(runner, "_run_single_node", side_effect=lambda *, node, **kw: (node, 0, "ok")),
+                patch.object(runner, "_pick_master_port", return_value=29500),
+                patch.object(runner, "_collect_multi_node_traces", return_value=combined),
+            ):
+                result = runner.run()
+
+            self.assertEqual(result.get_artifact("torch_traces"), combined)
+
     def test_failed_node_does_not_block_trace_collection(self):
         with tempfile.TemporaryDirectory() as tmp:
             aorta_path = Path(tmp)
@@ -525,6 +574,28 @@ class TestCombinedTracesIn(unittest.TestCase):
 
 
 class TestCopyLocalTorchProfilers(unittest.TestCase):
+    def test_only_fresh_files_are_copied_from_a_reused_profiler_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profiler = root / "output" / "torch_profiler"
+            for name, mtime in (
+                ("rank0/trace_step100.json", 1),
+                ("rank0/trace_step10.json", 100.5),
+                ("rank8/trace.json", 1),
+            ):
+                trace = profiler / name
+                trace.parent.mkdir(parents=True, exist_ok=True)
+                trace.write_text(name)
+                os.utime(trace, (mtime, mtime))
+            dest = root / "combined_traces" / "node_0"
+            runner = _make_runner(nodes=["head"], aorta_path=root)
+
+            self.assertTrue(runner._copy_local_torch_profilers(root, dest, min_mtime=100.5))
+
+            copied = [str(path.relative_to(dest)) for path in dest.rglob("*.json")]
+            self.assertEqual(copied, ["output/torch_profiler/rank0/trace_step10.json"])
+            self.assertTrue((profiler / "rank0/trace_step100.json").exists())
+
     def test_copies_torch_profiler_trees_and_skips_combined(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -555,6 +626,75 @@ class TestCopyLocalTorchProfilers(unittest.TestCase):
             dest.mkdir()
             runner = _make_runner(nodes=["a"], aorta_path=str(root))
             self.assertFalse(runner._copy_local_torch_profilers(root, dest))
+
+
+class TestCopyRemoteTorchProfilers(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name) / "torch_profiler" / "aorta checkout"
+        self.dest = Path(tmp.name) / "collected"
+        self.fresh_paths = [
+            "run with spaces/torch_profiler/rank0/trace_step10.json",
+            "run with spaces/torch_profiler/rank1/trace with\nnewline.json",
+        ]
+        for name, mtime in (
+            *((name, 100.5) for name in self.fresh_paths),
+            ("run with spaces/torch_profiler/rank0/trace_step100.json", 1),
+            ("run with spaces/torch_profiler/rank8/trace.json", 1),
+            ("combined_traces/node_0/torch_profiler/rank0/trace.json", 200),
+            ("unrelated.json", 200),
+        ):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(name)
+            os.utime(path, (mtime, mtime))
+        self.runner = _make_runner(nodes=["head", "worker"], aorta_path=self.root)
+        self.run_process = subprocess.run
+
+    def _mock_transport(self, cmd, **kwargs):
+        if cmd[0] == "ssh":
+            return self.run_process(["sh", "-c", cmd[-1]], capture_output=True, text=True)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def test_rsync_receives_only_fresh_files_with_whitespace_preserved(self):
+        with (
+            patch.object(aorta_mod.subprocess, "run", side_effect=self._mock_transport) as transport,
+            patch("shutil.which", return_value="/usr/bin/rsync"),
+        ):
+            self.assertTrue(self.runner._copy_remote_torch_profilers("worker", self.dest, min_mtime=100.5))
+
+        self.assertEqual(transport.call_count, 2)
+        transfer = transport.call_args
+        self.assertEqual(set(transfer.kwargs["input"].split("\0")[:-1]), set(self.fresh_paths))
+        cmd = transfer.args[0]
+        self.assertIn("--from0", cmd)
+        self.assertIn("--files-from=-", cmd)
+        self.assertIn("--protect-args", cmd)
+        self.assertEqual(cmd[-2:], [f"testuser@worker:{self.root}/", str(self.dest) + "/"])
+
+    def test_scp_fallback_copies_only_selected_files(self):
+        with (
+            patch.object(aorta_mod.subprocess, "run", side_effect=self._mock_transport) as transport,
+            patch("shutil.which", return_value=None),
+        ):
+            self.assertTrue(self.runner._copy_remote_torch_profilers("worker", self.dest, min_mtime=100.5))
+
+        transfers = [call.args[0] for call in transport.call_args_list[1:]]
+        self.assertTrue(all(cmd[0] == "scp" for cmd in transfers))
+        self.assertEqual({cmd[-2] for cmd in transfers}, {f"testuser@worker:{self.root}/{p}" for p in self.fresh_paths})
+        self.assertEqual({cmd[-1] for cmd in transfers}, {str(self.dest / p) for p in self.fresh_paths})
+
+    def test_no_fresh_remote_files_does_not_start_a_transfer(self):
+        with patch.object(aorta_mod.subprocess, "run", side_effect=self._mock_transport) as transport:
+            self.assertFalse(self.runner._copy_remote_torch_profilers("worker", self.dest, min_mtime=300))
+        transport.assert_called_once()
+
+    def test_failed_listing_is_reported_without_starting_a_transfer(self):
+        result = subprocess.CompletedProcess([], 255, stdout="", stderr="connection failed")
+        with patch.object(aorta_mod.subprocess, "run", return_value=result) as transport:
+            self.assertFalse(self.runner._copy_remote_torch_profilers("worker", self.dest, min_mtime=100))
+        transport.assert_called_once()
 
 
 class TestRunTracelensAnalysisDependencyCheck(unittest.TestCase):
@@ -678,7 +818,8 @@ class TestCollectMultiNodeTracesHeadOnly(unittest.TestCase):
             # run's copy must not still be sitting in combined_traces, where
             # it would be mistaken for this run's data.
             shutil.rmtree(root / "artifacts" / "torch_profiler")
-            second = runner._collect_multi_node_traces([socket.gethostname()])
+            with patch.object(runner, "_copy_remote_torch_profilers", return_value=False):
+                second = runner._collect_multi_node_traces([socket.gethostname()])
 
             self.assertIsNone(second)
             self.assertFalse(stale_file.exists())
@@ -691,9 +832,11 @@ class TestCollectMultiNodeTracesHeadOnly(unittest.TestCase):
 
             runner = _make_runner(nodes=[socket.gethostname()], aorta_path=str(root))
             # First run had 3 nodes; node_2 belongs to a node no longer in this run.
-            first = runner._collect_multi_node_traces([socket.gethostname(), "10.0.0.2", "10.0.0.3"])
+            with patch.object(runner, "_copy_remote_torch_profilers", return_value=False) as remote_copy:
+                first = runner._collect_multi_node_traces([socket.gethostname(), "worker1", "worker2"])
             self.assertIsNotNone(first)
             self.assertTrue((root / "combined_traces" / "node_2").exists())
+            self.assertEqual(remote_copy.call_count, 2)
 
             # This run only has one node -- the old node_2 must not survive, or a
             # parser walking combined_traces would still see its stale rank data.
@@ -723,7 +866,8 @@ class TestCollectMultiNodeTracesSourceFreshness(unittest.TestCase):
             runner = _make_runner(nodes=[socket.gethostname()], aorta_path=str(root))
             # This run "started" after the file above was written, so it must
             # not be mistaken for this run's data.
-            result = runner._collect_multi_node_traces([socket.gethostname()], min_mtime=old_mtime + 1800)
+            with patch.object(runner, "_copy_remote_torch_profilers", return_value=False):
+                result = runner._collect_multi_node_traces([socket.gethostname()], min_mtime=old_mtime + 1800)
 
             self.assertIsNone(result)
             self.assertFalse((root / "combined_traces" / "node_0" / "artifacts").exists())
