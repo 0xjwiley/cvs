@@ -272,6 +272,38 @@ class AortaRunner(BaseRunner):
             log.debug(f"Could not get remote UID/GID for {node}: {e}")
         return None
 
+    def _resolve_group_add(self, node: str) -> List[str]:
+        """
+        Resolve the container's group_add list for GPU device access on `node`.
+
+        "video" exists on essentially every distro. "render" does not (e.g. some
+        minimal/older images), and containers.run() fails outright if a requested
+        group is missing on the host, so probe for it over SSH before requesting it.
+        """
+        groups = ["video"]
+        try:
+            result = subprocess.run(
+                [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=10",
+                    f"{self.config.username}@{node}",
+                    "getent group render",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                groups.append("render")
+            else:
+                log.debug(f"No 'render' group on {node}; launching with group_add={groups}")
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            log.debug(f"Could not check for 'render' group on {node}: {e}")
+        return groups
+
     def _launch_container(self, client: docker.DockerClient, node: str) -> Container:
         """
         Launch Aorta container on a node.
@@ -309,7 +341,7 @@ class AortaRunner(BaseRunner):
             devices=devices,
             working_dir=self.config.container_mount_path,
             user="root",
-            group_add=["video", "render"],
+            group_add=self._resolve_group_add(node),
             cap_add=["SYS_PTRACE"],
             security_opt=["seccomp=unconfined"],
             ulimits=[
@@ -570,7 +602,10 @@ class AortaRunner(BaseRunner):
             # `--override` groups collapse to the last group's values. Emit a
             # single `--override` followed by all key=value tokens so that
             # downstream legacy launch scripts also forward them correctly.
-            tokens = " ".join(f'{key}="{value}"' for key, value in self.config.training_overrides.items())
+            # No shell re-parses this string, so embedded quote characters
+            # would reach argparse literally (e.g. training.max_steps="15"
+            # instead of training.max_steps=15) -- emit bare key=value tokens.
+            tokens = " ".join(f"{key}={value}" for key, value in self.config.training_overrides.items())
             env["AORTA_OVERRIDE_ARGS"] = f"--override {tokens}"
 
         return env

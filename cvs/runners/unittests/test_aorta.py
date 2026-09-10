@@ -70,8 +70,9 @@ class TestBuildBaseEnv(unittest.TestCase):
         runner = _make_runner(nodes=["a"], aorta_path="/tmp/aorta")
         runner.config.training_overrides = {"training.max_steps": 5}
         env = runner._build_base_env()
-        self.assertIn("AORTA_OVERRIDE_ARGS", env)
-        self.assertIn("training.max_steps", env["AORTA_OVERRIDE_ARGS"])
+        # No shell re-parses this string, so it must not contain embedded quote
+        # characters -- those would reach argparse literally as part of the value.
+        self.assertEqual(env["AORTA_OVERRIDE_ARGS"], "--override training.max_steps=5")
 
     def test_multi_key_overrides_share_one_override_group(self):
         # Aorta train.py uses argparse(--override, nargs="*"); multiple
@@ -84,17 +85,22 @@ class TestBuildBaseEnv(unittest.TestCase):
             "profiling.active": 3,
         }
         env = runner._build_base_env()
-        self.assertEqual(env["AORTA_OVERRIDE_ARGS"].count("--override"), 1)
-        for key in runner.config.training_overrides:
-            self.assertIn(key, env["AORTA_OVERRIDE_ARGS"])
+        self.assertEqual(
+            env["AORTA_OVERRIDE_ARGS"],
+            "--override training.max_steps=5 training.batch_size=8 profiling.active=3",
+        )
 
 
 class TestLaunchContainerGpuAccess(unittest.TestCase):
-    def _launch(self):
+    def _launch(self, ssh_returncode=0, ssh_stdout="render:x:104:testuser\n"):
         runner = _make_runner(nodes=["a"], aorta_path="/tmp/aorta")
         client = Mock()
         client.containers.run.return_value.status = "running"
-        with patch.object(aorta_mod, "docker", Mock()):
+        ssh_result = Mock(returncode=ssh_returncode, stdout=ssh_stdout)
+        with (
+            patch.object(aorta_mod, "docker", Mock()),
+            patch.object(aorta_mod.subprocess, "run", return_value=ssh_result),
+        ):
             runner._launch_container(client, "a")
         return client.containers.run.call_args.kwargs
 
@@ -103,9 +109,14 @@ class TestLaunchContainerGpuAccess(unittest.TestCase):
         # the validation cluster could not open /dev/kfd even with --privileged.
         self.assertEqual(self._launch()["user"], "root")
 
-    def test_render_group_is_added(self):
-        self.assertIn("render", self._launch()["group_add"])
-        self.assertIn("video", self._launch()["group_add"])
+    def test_render_group_is_added_when_present_on_host(self):
+        self.assertEqual(self._launch()["group_add"], ["video", "render"])
+
+    def test_render_group_is_skipped_when_absent_on_host(self):
+        # containers.run() fails outright if a requested group is missing on the
+        # host, so a host without a "render" group must not request it.
+        kwargs = self._launch(ssh_returncode=2, ssh_stdout="")
+        self.assertEqual(kwargs["group_add"], ["video"])
 
 
 if __name__ == "__main__":
