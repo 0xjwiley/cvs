@@ -410,6 +410,47 @@ class TestSetupSingleNodeCancelledLate(unittest.TestCase):
         self.assertIs(r._containers["10.0.0.1"], fake_container)
         fake_container.stop.assert_not_called()
 
+    def test_registration_after_teardown_started_is_torn_down_not_registered(self):
+        # A straggling setup thread can reach the registration point after
+        # teardown() has already taken its snapshot of self._containers, even
+        # though cancel_event was never set (e.g. setup() returned True/False
+        # for unrelated reasons and execute() moved straight to teardown()).
+        # It must notice via self._teardown_started and clean up after itself
+        # instead of silently registering into a dict teardown() will never
+        # look at again.
+        r = _make_runner(nodes=["10.0.0.1"], aorta_path="/tmp/aorta")
+        fake_container = Mock()
+        cancel_event = threading.Event()
+        r._teardown_started = True
+
+        with (
+            patch.object(r, "_connect_docker", return_value=Mock()),
+            patch.object(r, "_cleanup_existing_containers"),
+            patch.object(r, "_launch_container", return_value=fake_container),
+        ):
+            node, success, error = r._setup_single_node("10.0.0.1", cancel_event)
+
+        self.assertFalse(success)
+        self.assertIn("timed out", error.lower())
+        self.assertNotIn("10.0.0.1", r._containers)
+        fake_container.stop.assert_called_once()
+        fake_container.remove.assert_called_once()
+
+    def test_teardown_snapshots_containers_so_concurrent_registration_does_not_crash(self):
+        # teardown() must iterate a snapshot, not the live self._containers dict.
+        # A straggling setup thread can insert into self._containers while
+        # teardown() is mid-iteration; if teardown() iterated the live dict,
+        # that mutation would raise "dictionary changed size during iteration".
+        r = _make_runner(nodes=["10.0.0.1"], aorta_path="/tmp/aorta")
+        existing = Mock()
+        existing.stop.side_effect = lambda *a, **k: r._containers.__setitem__("10.0.0.2", Mock())
+        r._containers["10.0.0.1"] = existing
+
+        with patch.object(r, "_get_remote_uid_gid", return_value=None):
+            r.teardown()  # must not raise
+
+        self.assertTrue(r._teardown_started)
+
 
 if __name__ == "__main__":
     unittest.main()

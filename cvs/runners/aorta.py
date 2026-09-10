@@ -200,7 +200,11 @@ class AortaRunner(BaseRunner):
         # Thread-safe storage for parallel deployment
         self._docker_clients: Dict[str, docker.DockerClient] = {}
         self._containers: Dict[str, Container] = {}
-        self._lock = Lock()  # Protects _docker_clients and _containers
+        self._lock = Lock()  # Protects _docker_clients, _containers, and _teardown_started
+        # Set under _lock once teardown() has taken its snapshot of _containers, so a
+        # straggling setup thread that registers after that point notices and cleans up
+        # after itself instead of leaking a container teardown() will never see again.
+        self._teardown_started = False
 
     def validate_config(self) -> List[str]:
         """Validate Aorta-specific configuration."""
@@ -551,9 +555,12 @@ class AortaRunner(BaseRunner):
             cancel_event: set by ``setup()`` once its overall deadline has
                 passed. A node that finishes launching its container after
                 that point tears the container down itself instead of
-                registering it into ``self._containers`` — ``teardown()``'s
-                single unsynchronized pass over that dict already ran and
-                won't see it otherwise, orphaning the container.
+                registering it into ``self._containers`` — ``teardown()``
+                may already have taken its snapshot of that dict and won't
+                see it otherwise, orphaning the container. The check and the
+                registration happen atomically under ``self._lock`` (see
+                ``self._teardown_started``) so there is no window between
+                them for ``teardown()`` to race past.
 
         Returns:
             Tuple of (node, success, error_message)
@@ -575,7 +582,16 @@ class AortaRunner(BaseRunner):
             # Launch container
             container = self._launch_container(client, node)
 
-            if cancel_event.is_set():
+            # Check-and-register must be atomic: if this happened as two separate
+            # steps, teardown() could take its snapshot of self._containers in the
+            # gap between the check and the registration and never see this
+            # container, orphaning it.
+            with self._lock:
+                too_late = cancel_event.is_set() or self._teardown_started
+                if not too_late:
+                    self._containers[node] = container
+
+            if too_late:
                 log.warning(f"Setup on {node} finished after the deadline; cleaning up its container")
                 try:
                     container.stop(timeout=30)
@@ -583,10 +599,6 @@ class AortaRunner(BaseRunner):
                 except Exception as e:
                     log.warning(f"Error removing late container on {node}: {e}")
                 return (node, False, f"Setup timed out after {self.config.timeout_seconds}s")
-
-            # Thread-safe update of shared state
-            with self._lock:
-                self._containers[node] = container
 
             # Build RCCL if not skipping
             if not self.config.skip_rccl_build:
@@ -641,6 +653,9 @@ class AortaRunner(BaseRunner):
 
         This significantly reduces setup time for multi-node clusters.
         """
+        with self._lock:
+            self._teardown_started = False
+
         if not self.config.aorta_path.exists() and not self._ensure_aorta_repo():
             log.error("Aorta path does not exist and auto-clone failed or is disabled")
             return False
@@ -1290,7 +1305,19 @@ class AortaRunner(BaseRunner):
 
         success = True
 
-        for node, container in self._containers.items():
+        # Snapshot-and-clear under the same lock _setup_single_node uses to register
+        # containers, so a straggling setup thread deterministically either lands in
+        # this snapshot (and gets torn down below) or observes _teardown_started and
+        # cleans up after itself -- never both, and never neither. Iterating
+        # self._containers directly here (unsynchronized) would also risk a
+        # "dictionary changed size during iteration" crash if a setup thread inserted
+        # into it concurrently.
+        with self._lock:
+            self._teardown_started = True
+            containers = dict(self._containers)
+            self._containers.clear()
+
+        for node, container in containers.items():
             try:
                 log.info(f"Stopping container on {node}...")
                 container.stop(timeout=30)
@@ -1327,8 +1354,6 @@ class AortaRunner(BaseRunner):
             except Exception as e:
                 log.warning(f"Error removing container on {node}: {e}")
                 success = False
-
-        self._containers.clear()
 
         # Close Docker clients - suppress BrokenPipeError during SSH cleanup
         for node, client in self._docker_clients.items():
