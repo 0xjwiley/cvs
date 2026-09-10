@@ -162,7 +162,6 @@ class PrimusTrainingJob:
         self.home_dir = os.path.expanduser('~')
         tdict = variant_config.job_config_dict()
         tdict.setdefault('training_iterations', 10)
-        tdict.setdefault('nnodes', '1')
         tdict.setdefault('nccl_socket_ifname', 'ensf1np1')
         tdict.setdefault('gloo_socket_ifname', 'ensf1np1')
         tdict.setdefault('nccl_ib_hca', 'bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re6,bnxt_re7')
@@ -181,14 +180,7 @@ class PrimusTrainingJob:
         self.save_interval = None
         self.load_checkpoint = False
 
-        self.nnodes = str(tdict['nnodes'])
-        if int(self.nnodes) != len(orch.hosts):
-            log.warning(
-                'config nnodes=%s does not match cluster host count=%d; using cluster host count',
-                self.nnodes,
-                len(orch.hosts),
-            )
-            self.nnodes = str(len(orch.hosts))
+        self.nnodes = str(len(orch.hosts))
 
         self.nccl_socket_ifname = tdict['nccl_socket_ifname']
         self.gloo_socket_ifname = tdict['gloo_socket_ifname']
@@ -370,12 +362,7 @@ class PrimusTrainingJob:
         exp_path = self._exp_config_path()
         log.info('Primus EXP config path: %s', exp_path)
 
-        env_exports = (
-            f'export HF_TOKEN="{self.hf_token}"; '
-            f'export LOG_DIR={self.log_dir}; '
-            f'export NCCL_SOCKET_IFNAME={self.nccl_socket_ifname}; '
-            f'export GLOO_SOCKET_IFNAME={self.gloo_socket_ifname}; '
-        )
+        env_exports = f'export HF_TOKEN="{self.hf_token}"; export LOG_DIR={self.log_dir}; '
 
         if re.search(r'MI3(00|25)X', self.gpu_arch, re.I):
             env_exports += 'export PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32=1; export NVTE_CK_IS_V3_ATOMIC_FP32=1; '
@@ -404,17 +391,12 @@ class PrimusTrainingJob:
                 batch_args += ' --auto_detect_ckpt_format'
 
         if self.distributed_training:
-            env_exports += (
-                f'export NCCL_IB_HCA={self.nccl_ib_hca}; '
-                f'export NCCL_DEBUG={self.nccl_debug}; '
-                f'export NCCL_IB_GID_INDEX={self.nccl_ib_gid_index}; '
-            )
             for i in range(len(self.orch.hosts)):
                 log_file = f'{self.combo_log_dir}/out-node{i}/training.log'
                 full_cmd = (
                     env_exports
                     + f'cd {self.primus_root} && '
-                    + f'NNODES={self.nnodes} NODE_RANK={i} MASTER_ADDR={self.master_address} '
+                    + f'NODE_RANK={i} '
                     + f'nohup bash {self.primus_cli} direct '
                     + f'--log_file {log_file} '
                     + f'-- train pretrain --config {exp_path} {batch_args} &'
