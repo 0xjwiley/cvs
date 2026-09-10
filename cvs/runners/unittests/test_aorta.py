@@ -91,6 +91,37 @@ class TestBuildBaseEnv(unittest.TestCase):
         )
 
 
+class TestBuildExperimentCommand(unittest.TestCase):
+    def test_no_override_args_without_training_overrides(self):
+        runner = _make_runner(nodes=["a"], aorta_path="/tmp/aorta")
+        cmd = runner._build_experiment_command()
+        self.assertEqual(cmd, "bash /mnt/scripts/launch_rocm.sh /mnt/config/distributed.yaml")
+
+    def test_training_overrides_are_appended_to_command(self):
+        # Computing AORTA_OVERRIDE_ARGS is not enough -- launch_rocm.sh only
+        # reads argv, so the override tokens must also land on the command
+        # line actually executed, not just in the environment.
+        runner = _make_runner(nodes=["a"], aorta_path="/tmp/aorta")
+        runner.config.training_overrides = {"training.max_steps": 5}
+        cmd = runner._build_experiment_command()
+        self.assertTrue(cmd.endswith("--override training.max_steps=5"), cmd)
+
+    def test_multi_key_overrides_share_one_override_group(self):
+        runner = _make_runner(nodes=["a"], aorta_path="/tmp/aorta")
+        runner.config.training_overrides = {
+            "training.max_steps": 5,
+            "training.batch_size": 8,
+        }
+        cmd = runner._build_experiment_command()
+        self.assertTrue(cmd.endswith("--override training.max_steps=5 training.batch_size=8"), cmd)
+
+    def test_override_values_needing_quoting_are_shell_safe(self):
+        runner = _make_runner(nodes=["a"], aorta_path="/tmp/aorta")
+        runner.config.training_overrides = {"training.tag": "a b"}
+        cmd = runner._build_experiment_command()
+        self.assertTrue(cmd.endswith("--override training.tag='a b'"), cmd)
+
+
 class TestLaunchContainerGpuAccess(unittest.TestCase):
     def _launch(self, ssh_returncode=0, ssh_stdout="render:x:104:testuser\n"):
         runner = _make_runner(nodes=["a"], aorta_path="/tmp/aorta")

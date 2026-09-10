@@ -11,6 +11,7 @@ All rights reserved.
 from __future__ import annotations
 
 import logging
+import shlex
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -610,6 +611,20 @@ class AortaRunner(BaseRunner):
 
         return env
 
+    def _build_experiment_command(self) -> str:
+        """Build the ``bash experiment_script config_path [--override ...]`` command."""
+        config_path = f"{self.config.container_mount_path}/{self.config.base_config}"
+        exp_cmd = f"bash {self.config.container_mount_path}/{self.config.experiment_script} {config_path}"
+        if self.config.training_overrides:
+            # AORTA_OVERRIDE_ARGS (see _build_base_env) only reaches the process
+            # environment; nothing consumes it unless it's also appended to the
+            # argv the experiment script receives.
+            override_parts = ["--override"]
+            for key, value in self.config.training_overrides.items():
+                override_parts.append(f"{key}={shlex.quote(str(value))}")
+            exp_cmd += " " + " ".join(override_parts)
+        return exp_cmd
+
     def run(self, **kwargs) -> RunResult:
         """
         Execute the Aorta benchmark.
@@ -642,8 +657,7 @@ class AortaRunner(BaseRunner):
 
             # Pass the base config file to the experiment script
             # launch_rocm.sh expects: CONFIG=${1:-default.yaml}
-            config_path = f"{self.config.container_mount_path}/{self.config.base_config}"
-            exp_cmd = f"bash {self.config.container_mount_path}/{self.config.experiment_script} {config_path}"
+            exp_cmd = self._build_experiment_command()
             log.info(f"Running experiment: {exp_cmd}")
             log.info("Streaming output (this may take several minutes)...")
 
