@@ -13,14 +13,17 @@ from cvs.runners._base_runner import BaseRunner, RunConfig, RunResult, RunStatus
 class _FakeRunner(BaseRunner):
     """Minimal concrete BaseRunner for exercising execute()."""
 
-    def __init__(self, config, setup_return=True, run_return=None, run_raises=None):
+    def __init__(self, config, setup_return=True, setup_raises=None, run_return=None, run_raises=None):
         super().__init__(config)
         self._setup_return = setup_return
+        self._setup_raises = setup_raises
         self._run_return = run_return
         self._run_raises = run_raises
         self.teardown_calls = 0
 
     def setup(self) -> bool:
+        if self._setup_raises is not None:
+            raise self._setup_raises
         return self._setup_return
 
     def run(self, **kwargs) -> RunResult:
@@ -54,6 +57,15 @@ class TestExecuteTeardownLifecycle(unittest.TestCase):
 
         self.assertEqual(result.status, RunStatus.FAILED)
         self.assertEqual(result.error_message, "Setup failed")
+        self.assertEqual(runner.teardown_calls, 1)
+
+    def test_teardown_runs_when_setup_raises(self):
+        runner = _FakeRunner(_config(), setup_raises=RuntimeError("setup exploded"))
+
+        result = runner.execute()
+
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertIn("setup exploded", result.error_message)
         self.assertEqual(runner.teardown_calls, 1)
 
     def test_teardown_runs_when_run_raises(self):
