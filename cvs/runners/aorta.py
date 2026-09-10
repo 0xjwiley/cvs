@@ -314,6 +314,8 @@ class AortaRunner(BaseRunner):
 
         Returns ``None`` only when nothing could be collected at all.
         """
+        import shutil
+
         head = self.head_node
         combined_root = self.config.aorta_path / "combined_traces"
         try:
@@ -325,6 +327,14 @@ class AortaRunner(BaseRunner):
         any_collected = False
         for rank, node in enumerate(nodes):
             dest = combined_root / f"node_{rank}"
+            # Clear any leftover content from a previous run before repopulating, so
+            # a node that fails to produce traces this run (or is unreachable) can't
+            # have stale prior-run data silently mixed into this run's metrics.
+            if dest.exists():
+                try:
+                    shutil.rmtree(dest)
+                except OSError as e:
+                    log.warning(f"Could not clear stale {dest}: {e}")
             dest.mkdir(parents=True, exist_ok=True)
 
             try:
@@ -347,6 +357,32 @@ class AortaRunner(BaseRunner):
                 log.warning(f"Failed to collect traces for node {node} (rank {rank}): {e}")
 
         return combined_root if any_collected else None
+
+    def _resolve_analysis_output_dir(self, trace_dir: Optional[Path], output_dir: Optional[Path]) -> Optional[Path]:
+        """
+        Resolve the ``output_dir`` to hand to the container TraceLens/GEMM scripts,
+        which expect ``output_dir/torch_profiler`` directly.
+
+        When ``trace_dir`` is the aggregated ``combined_traces`` root (multi-node),
+        ``output_dir`` would otherwise be ``aorta_path`` itself -- the whole mount,
+        which has no ``torch_profiler`` child of its own -- so resolve to the head
+        node's own trace tree (``combined_traces/node_0``, rank 0 always being the
+        head node per ``_collect_multi_node_traces``) instead. Returns ``None`` when
+        no such tree can be found, so callers skip analysis rather than pass a
+        directory the scripts cannot use.
+        """
+        if trace_dir is None or output_dir is None:
+            return None
+
+        combined_root = self.config.aorta_path / "combined_traces"
+        if trace_dir != combined_root:
+            return output_dir
+
+        head_trace = next((combined_root / "node_0").glob("**/torch_profiler"), None)
+        if head_trace is None:
+            log.warning("No torch_profiler tree found for the head node under combined_traces; skipping analysis")
+            return None
+        return head_trace.parent
 
     def _copy_local_torch_profilers(self, src_root: Path, dest: Path) -> bool:
         """
@@ -1280,15 +1316,17 @@ class AortaRunner(BaseRunner):
             # Parsing/validation use host venv by default; container reports are consumed when present.
             # In multi-node mode the head node's container is used; the analysis scripts
             # operate on traces under aorta_path which (for collected traces) is on the head node.
+            #
+            # The TraceLens/GEMM scripts expect output_dir/torch_profiler directly. When
+            # trace_dir is the aggregated combined_traces root (multi-node), output_dir
+            # would otherwise be aorta_path itself -- the whole mount, not a directory
+            # that actually contains torch_profiler -- so resolve it to the head node's
+            # own trace tree inside combined_traces instead.
+            analysis_output_dir = self._resolve_analysis_output_dir(trace_dir, output_dir)
             analysis_container = self._containers.get(self.head_node)
-            if (
-                self.config.analysis.enable_tracelens
-                and trace_dir
-                and trace_dir.exists()
-                and analysis_container is not None
-            ):
+            if self.config.analysis.enable_tracelens and analysis_output_dir and analysis_container is not None:
                 log.info("Container TraceLens analysis (optional): attempting in-container report generation")
-                analysis_result = self._run_tracelens_analysis(analysis_container, output_dir)
+                analysis_result = self._run_tracelens_analysis(analysis_container, analysis_output_dir)
                 if analysis_result:
                     artifacts["tracelens_analysis"] = analysis_result
                     log.info(f"Container TraceLens analysis completed: {analysis_result}")
@@ -1296,13 +1334,8 @@ class AortaRunner(BaseRunner):
                     log.warning("Container TraceLens skipped or failed; host will parse raw traces")
 
             # Run GEMM analysis if enabled (optional, same as TraceLens)
-            if (
-                self.config.analysis.enable_gemm_analysis
-                and trace_dir
-                and trace_dir.exists()
-                and analysis_container is not None
-            ):
-                gemm_result = self._run_gemm_analysis(analysis_container, output_dir)
+            if self.config.analysis.enable_gemm_analysis and analysis_output_dir and analysis_container is not None:
+                gemm_result = self._run_gemm_analysis(analysis_container, analysis_output_dir)
                 if gemm_result:
                     artifacts["gemm_analysis"] = gemm_result
                     log.info(f"GEMM analysis completed: {gemm_result}")
@@ -1341,6 +1374,7 @@ class AortaRunner(BaseRunner):
                 stdout=stdout_dict,
                 stderr=stderr_dict,
                 exit_codes=exit_codes,
+                artifacts=artifacts,
                 error_message=str(e),
             )
 
@@ -1368,10 +1402,18 @@ class AortaRunner(BaseRunner):
             return analysis_dir
 
         # Fast dependency check to avoid running long scripts that will fail immediately.
-        check_cmd = 'python3 -c "import TraceLens"'
-        check_exit, _ = self._exec_in_container(container, check_cmd)
-        if check_exit != 0:
-            log.warning("TraceLens python package not available in container; skipping TraceLens analysis")
+        # This is best-effort: TraceLens is optional analysis layered on top of
+        # already-collected artifacts, so a failure probing for it (e.g. the
+        # container/exec itself misbehaving) must not escape and be mistaken by
+        # run()'s caller for a failure of the run itself.
+        try:
+            check_cmd = 'python3 -c "import TraceLens"'
+            check_exit, _ = self._exec_in_container(container, check_cmd)
+            if check_exit != 0:
+                log.warning("TraceLens python package not available in container; skipping TraceLens analysis")
+                return None
+        except Exception as e:
+            log.warning(f"Could not check for TraceLens in container; skipping TraceLens analysis: {e}")
             return None
 
         # Build the analysis command

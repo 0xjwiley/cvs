@@ -10,6 +10,7 @@ Copyright 2025 Advanced Micro Devices, Inc.
 All rights reserved.
 """
 
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -553,6 +554,85 @@ class TestCopyLocalTorchProfilers(unittest.TestCase):
             self.assertFalse(runner._copy_local_torch_profilers(root, dest))
 
 
+class TestRunTracelensAnalysisDependencyCheck(unittest.TestCase):
+    def test_dependency_check_exception_is_caught_not_raised(self):
+        # TraceLens analysis is optional, best-effort post-processing. An
+        # exception while merely probing whether the package is importable
+        # (e.g. the container exec plumbing itself failing) must not escape
+        # and be mistaken by run()'s caller for the run itself having failed.
+        r = _make_runner(nodes=["10.0.0.1"], aorta_path="/tmp/aorta")
+        with patch.object(r, "_exec_in_container", side_effect=RuntimeError("docker exec blew up")):
+            result = r._run_tracelens_analysis(Mock(), Path("/tmp/aorta/some_run"))
+        self.assertIsNone(result)
+
+    def test_dependency_missing_skips_without_raising(self):
+        r = _make_runner(nodes=["10.0.0.1"], aorta_path="/tmp/aorta")
+        with patch.object(r, "_exec_in_container", return_value=(1, "ModuleNotFoundError")):
+            result = r._run_tracelens_analysis(Mock(), Path("/tmp/aorta/some_run"))
+        self.assertIsNone(result)
+
+
+class TestRunExceptionPreservesArtifacts(unittest.TestCase):
+    def test_exception_after_trace_collection_still_returns_collected_artifacts(self):
+        # A failure in later, optional post-processing (e.g. TraceLens analysis)
+        # must not discard torch_traces and other artifacts already collected
+        # earlier in run() -- those are exactly what a partially-failed run
+        # needs to be salvageable.
+        with tempfile.TemporaryDirectory() as tmp:
+            aorta_path = Path(tmp)
+            combined_root = aorta_path / "combined_traces"
+            (combined_root / "node_0").mkdir(parents=True)
+            r = _make_runner(nodes=["10.0.0.1", "10.0.0.2"], aorta_path=aorta_path)
+
+            def fake_run_single_node(*, node, node_rank, launch_cmd, env):
+                return (node, 0, "ok")
+
+            with (
+                patch.object(r, "_run_single_node", side_effect=fake_run_single_node),
+                patch.object(r, "_pick_master_port", return_value=29500),
+                patch.object(r, "_collect_multi_node_traces", return_value=combined_root),
+                patch.object(r, "_resolve_analysis_output_dir", side_effect=RuntimeError("boom")),
+            ):
+                result = r.run()
+
+            self.assertEqual(result.status, RunStatus.FAILED)
+            self.assertEqual(result.get_artifact("torch_traces"), combined_root)
+
+
+class TestResolveAnalysisOutputDir(unittest.TestCase):
+    def test_non_combined_trace_dir_is_returned_unchanged(self):
+        r = _make_runner(nodes=["10.0.0.1"], aorta_path="/tmp/aorta")
+        trace_dir = Path("/tmp/aorta/some_run/torch_profiler")
+        output_dir = trace_dir.parent
+        self.assertEqual(r._resolve_analysis_output_dir(trace_dir, output_dir), output_dir)
+
+    def test_combined_trace_dir_resolves_to_head_nodes_own_tree(self):
+        # trace_dir/output_dir as computed in run() for the combined multi-node
+        # case: output_dir is aorta_path itself, which has no torch_profiler
+        # child of its own and is useless to the analysis scripts.
+        with tempfile.TemporaryDirectory() as tmp:
+            aorta_path = Path(tmp)
+            head_trace = aorta_path / "combined_traces" / "node_0" / "artifacts" / "torch_profiler"
+            head_trace.mkdir(parents=True)
+
+            r = _make_runner(nodes=["10.0.0.1", "10.0.0.2"], aorta_path=aorta_path)
+            trace_dir = aorta_path / "combined_traces"
+            resolved = r._resolve_analysis_output_dir(trace_dir, aorta_path)
+
+            self.assertEqual(resolved, head_trace.parent)
+
+    def test_combined_trace_dir_with_no_head_tree_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            aorta_path = Path(tmp)
+            (aorta_path / "combined_traces" / "node_0").mkdir(parents=True)
+
+            r = _make_runner(nodes=["10.0.0.1", "10.0.0.2"], aorta_path=aorta_path)
+            trace_dir = aorta_path / "combined_traces"
+            resolved = r._resolve_analysis_output_dir(trace_dir, aorta_path)
+
+            self.assertIsNone(resolved)
+
+
 class TestCollectMultiNodeTracesHeadOnly(unittest.TestCase):
     """
     End-to-end happy path for trace collection where every node is the head
@@ -577,6 +657,28 @@ class TestCollectMultiNodeTracesHeadOnly(unittest.TestCase):
                     root / "combined_traces" / "node_0" / "artifacts" / "torch_profiler" / "rank_0" / "trace.json"
                 ).exists()
             )
+
+    def test_stale_trace_from_previous_run_is_cleared_before_recollection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "artifacts" / "torch_profiler" / "rank_0").mkdir(parents=True)
+            (root / "artifacts" / "torch_profiler" / "rank_0" / "trace.json").write_text("run1")
+
+            runner = _make_runner(nodes=[socket.gethostname()], aorta_path=str(root))
+            first = runner._collect_multi_node_traces([socket.gethostname()])
+            self.assertIsNotNone(first)
+            stale_file = root / "combined_traces" / "node_0" / "artifacts" / "torch_profiler" / "rank_0" / "trace.json"
+            self.assertEqual(stale_file.read_text(), "run1")
+
+            # Second run: this node produces no new torch_profiler output this
+            # time (e.g. training crashed before profiling started). The prior
+            # run's copy must not still be sitting in combined_traces, where
+            # it would be mistaken for this run's data.
+            shutil.rmtree(root / "artifacts" / "torch_profiler")
+            second = runner._collect_multi_node_traces([socket.gethostname()])
+
+            self.assertIsNone(second)
+            self.assertFalse(stale_file.exists())
 
 
 if __name__ == "__main__":

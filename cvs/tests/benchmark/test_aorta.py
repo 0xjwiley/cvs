@@ -413,7 +413,7 @@ class TestAortaBenchmark:
 
         # Build report
         report = {
-            "status": "completed",
+            "status": run_result.status.value if run_result else "unknown",
             "duration_seconds": run_result.duration_seconds if run_result else 0,
             "cluster": {
                 "nodes": result.num_nodes,
