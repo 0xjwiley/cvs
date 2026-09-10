@@ -204,8 +204,8 @@ The **dropdown above** is the full **shipped** ``aorta_benchmark.yaml``. Where t
      - ``null`` (free ephemeral port)
      - Port for the ``torchrun`` rendezvous (``--master_port``). Pin this when you need a deterministic port (e.g., firewalled environments).
    * - ``multi_node.master_addr``
-     - ``null`` (head node from cluster.json)
-     - Override the rendezvous address (``--master_addr``).
+     - ``null`` (head node's ``node_vpc_ips`` entry, else its plain identifier)
+     - Override the rendezvous address (``--master_addr``). Do not pin this to the SSH/management address on a fabric-separated cluster -- other nodes rendezvous over the RDMA fabric, and ``node_vpc_ips`` exists precisely to prefer that address.
    * - ``multi_node.train_script``
      - ``train.py``
      - Aorta training entry script relative to ``aorta_path``. Used in ``torchrun`` mode.
@@ -264,7 +264,7 @@ The multi-node behavior is controlled by the ``multi_node`` block in ``aorta_ben
     master_launch_mode: auto      # auto | script | torchrun
     nproc_per_node: 8             # defaults to gpus_per_node
     master_port: 29500            # default: free ephemeral port
-    master_addr: 10.0.0.1         # default: head node from cluster.json
+    master_addr: 10.0.0.1         # default: head node's node_vpc_ips entry, else its identifier
     train_script: train.py
     extra_torchrun_args: []
     extra_train_args: []

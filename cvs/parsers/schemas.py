@@ -474,10 +474,11 @@ class AortaMultiNodeConfigFile(BaseModel):
     disaggregated ``torchrun`` invocation on every node (one per ``node_dict``
     entry), rendezvous-ing on the head node. This block tunes that path.
 
-    Single-node clusters ignore this block; ``master_launch_mode`` defaults to
-    ``auto`` which means: ``script`` (current behavior, single-node) when the
-    cluster has one node, ``torchrun`` (multi-node disaggregated) when it has
-    more than one.
+    Single-node clusters ignore this block only under the ``auto`` default,
+    which resolves to ``script`` (current behavior) for one node and
+    ``torchrun`` (multi-node disaggregated) for more than one. Explicitly
+    setting ``master_launch_mode: torchrun`` on a single-node cluster still
+    activates ``train_script``, ``extra_env``, and ``master_addr``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -512,7 +513,11 @@ class AortaMultiNodeConfigFile(BaseModel):
     master_addr: Optional[str] = Field(
         default=None,
         description=(
-            "Override the master address (--master_addr). Defaults to the head node hostname/IP from the cluster file."
+            "Override the master address (--master_addr). When unset, resolves to the "
+            "head node's node_vpc_ips entry if the cluster file defines one, otherwise "
+            "falls back to the head node's plain identifier. Do not pin this to the "
+            "SSH/management address on a fabric-separated cluster: other nodes rendezvous "
+            "over the RDMA fabric, and node_vpc_ips exists precisely to prefer that address."
         ),
     )
     train_script: str = Field(
