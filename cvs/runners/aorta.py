@@ -197,6 +197,11 @@ class AortaRunner(BaseRunner):
     4. Collect profiling artifacts
     """
 
+    # Tolerance subtracted from run()'s start time before using it as the trace
+    # freshness floor in _collect_multi_node_traces, to absorb clock skew between
+    # the orchestrator and cluster nodes without needing per-node clock sync.
+    _TRACE_FRESHNESS_SKEW_SECONDS = 60
+
     def __init__(self, config: AortaConfig):
         """
         Initialize Aorta runner.
@@ -297,7 +302,7 @@ class AortaRunner(BaseRunner):
         except Exception as e:
             log.warning(f"Error cleaning up container on {node}: {e}")
 
-    def _collect_multi_node_traces(self, nodes: List[str]) -> Optional[Path]:
+    def _collect_multi_node_traces(self, nodes: List[str], min_mtime: Optional[float] = None) -> Optional[Path]:
         """
         Collect torch_profiler trees from every node into a single tree on the
         head node and return the parent directory.
@@ -312,12 +317,30 @@ class AortaRunner(BaseRunner):
         individual nodes are logged but do not abort the overall collection;
         the returned directory is the best-effort union.
 
+        ``min_mtime`` (a ``time.time()``-style epoch), when given, excludes any
+        torch_profiler tree with no file modified at/after it: a node that is
+        unreachable or fails before writing new output this run must not have
+        an older run's torch_profiler tree copied in as if it were current --
+        including when the training config reuses the same output_dir across
+        runs, so the tree itself can't be told apart from a fresh one by path
+        alone.
+
         Returns ``None`` only when nothing could be collected at all.
         """
         import shutil
 
         head = self.head_node
         combined_root = self.config.aorta_path / "combined_traces"
+        # Recreate the whole tree from scratch every run. Clearing only the rank
+        # directories this run's node list would populate leaves a smaller run's
+        # combined tree contaminated with higher-numbered node_<rank> directories
+        # from a previous, larger-cluster run, which the parser would then read
+        # as if they were current data.
+        if combined_root.exists():
+            try:
+                shutil.rmtree(combined_root)
+            except OSError as e:
+                log.warning(f"Could not clear stale {combined_root}: {e}")
         try:
             combined_root.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -327,14 +350,6 @@ class AortaRunner(BaseRunner):
         any_collected = False
         for rank, node in enumerate(nodes):
             dest = combined_root / f"node_{rank}"
-            # Clear any leftover content from a previous run before repopulating, so
-            # a node that fails to produce traces this run (or is unreachable) can't
-            # have stale prior-run data silently mixed into this run's metrics.
-            if dest.exists():
-                try:
-                    shutil.rmtree(dest)
-                except OSError as e:
-                    log.warning(f"Could not clear stale {dest}: {e}")
             dest.mkdir(parents=True, exist_ok=True)
 
             try:
@@ -342,12 +357,12 @@ class AortaRunner(BaseRunner):
                 # the head==orchestrator case and any NFS-shared aorta_path.
                 found = False
                 if node == head:
-                    found = self._copy_local_torch_profilers(self.config.aorta_path, dest)
+                    found = self._copy_local_torch_profilers(self.config.aorta_path, dest, min_mtime=min_mtime)
                 # Pull over SSH for non-head nodes, and also for the head when the
                 # orchestrator's local fs didn't actually have the head's traces (i.e.
                 # orchestrator is a separate login node from the head).
                 if not found:
-                    found = self._copy_remote_torch_profilers(node, dest)
+                    found = self._copy_remote_torch_profilers(node, dest, min_mtime=min_mtime)
                 if found:
                     any_collected = True
                     log.info(f"Collected traces for node_{rank} ({node}) -> {dest}")
@@ -357,6 +372,17 @@ class AortaRunner(BaseRunner):
                 log.warning(f"Failed to collect traces for node {node} (rank {rank}): {e}")
 
         return combined_root if any_collected else None
+
+    @staticmethod
+    def _has_file_newer_than(path: Path, min_mtime: float) -> bool:
+        """Return ``True`` if ``path`` contains a file modified at/after ``min_mtime``."""
+        for f in path.rglob("*"):
+            try:
+                if f.is_file() and f.stat().st_mtime >= min_mtime:
+                    return True
+            except OSError:
+                continue
+        return False
 
     def _resolve_analysis_output_dir(self, trace_dir: Optional[Path], output_dir: Optional[Path]) -> Optional[Path]:
         """
@@ -384,10 +410,13 @@ class AortaRunner(BaseRunner):
             return None
         return head_trace.parent
 
-    def _copy_local_torch_profilers(self, src_root: Path, dest: Path) -> bool:
+    def _copy_local_torch_profilers(self, src_root: Path, dest: Path, min_mtime: Optional[float] = None) -> bool:
         """
         Copy any ``torch_profiler/`` trees under ``src_root`` into ``dest``,
         preserving the relative path. Used for the head node.
+
+        Trees with no file modified at/after ``min_mtime`` are skipped as
+        belonging to a previous run (see ``_collect_multi_node_traces``).
         """
         import shutil
 
@@ -396,6 +425,9 @@ class AortaRunner(BaseRunner):
             if not tp.is_dir():
                 continue
             if combined_traces_in(tp, src_root):
+                continue
+            if min_mtime is not None and not self._has_file_newer_than(tp, min_mtime):
+                log.warning(f"Skipping stale torch_profiler tree from a previous run: {tp}")
                 continue
             rel = tp.relative_to(src_root)
             target = dest / rel
@@ -409,11 +441,14 @@ class AortaRunner(BaseRunner):
                 log.warning(f"Local copy {tp} -> {target} failed: {e}")
         return copied
 
-    def _copy_remote_torch_profilers(self, node: str, dest: Path) -> bool:
+    def _copy_remote_torch_profilers(self, node: str, dest: Path, min_mtime: Optional[float] = None) -> bool:
         """
         Pull every ``torch_profiler/`` tree under the remote ``aorta_path`` to
         ``dest`` using rsync over SSH. Falls back to ``scp -r`` if rsync is
         unavailable.
+
+        Trees with no file modified at/after ``min_mtime`` are skipped as
+        belonging to a previous run (see ``_collect_multi_node_traces``).
         """
         ssh_user = self.config.username
         remote_root = str(self.config.aorta_path)
@@ -423,11 +458,25 @@ class AortaRunner(BaseRunner):
             ssh_opts.extend(["-i", self.config.pkey])
         ssh_cmd = "ssh " + " ".join(shlex.quote(p) for p in ssh_opts)
 
+        find_dirs = f"find {shlex.quote(remote_root)} -type d -name torch_profiler -not -path '*/combined_traces/*'"
+        if min_mtime is not None:
+            # For each candidate dir, only keep it if it has a file newer than
+            # min_mtime -- a plain directory mtime check is not reliable here
+            # since training may reuse the same torch_profiler/rank_N/ layout
+            # across runs, only overwriting file contents in place.
+            remote_cmd = (
+                f"for d in $({find_dirs}); do "
+                f'if [ -n "$(find "$d" -type f -newermt @{int(min_mtime)} -print -quit)" ]; then echo "$d"; fi; '
+                "done"
+            )
+        else:
+            remote_cmd = find_dirs
+
         list_cmd = [
             "ssh",
             *ssh_opts,
             f"{ssh_user}@{node}",
-            f"find {shlex.quote(remote_root)} -type d -name torch_profiler -not -path '*/combined_traces/*'",
+            remote_cmd,
         ]
         try:
             r = subprocess.run(list_cmd, capture_output=True, text=True, timeout=120)
@@ -1237,7 +1286,8 @@ class AortaRunner(BaseRunner):
                     log.error(f"Disaggregated run failed on {len(failed)}/{nnodes} nodes: {failed}")
 
                 if mn.collect_traces:
-                    combined = self._collect_multi_node_traces(nodes)
+                    trace_min_mtime = start_time - self._TRACE_FRESHNESS_SKEW_SECONDS
+                    combined = self._collect_multi_node_traces(nodes, min_mtime=trace_min_mtime)
                     if combined is not None:
                         artifacts["torch_traces"] = combined
                         log.info(f"Combined per-node traces collected at {combined}")

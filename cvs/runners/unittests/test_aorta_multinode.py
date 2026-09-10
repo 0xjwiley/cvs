@@ -10,6 +10,7 @@ Copyright 2025 Advanced Micro Devices, Inc.
 All rights reserved.
 """
 
+import os
 import shutil
 import socket
 import subprocess
@@ -476,7 +477,9 @@ class TestRunPartialNodeFailureStillCollectsTraces(unittest.TestCase):
             ):
                 result = r.run()
 
-            mock_collect.assert_called_once_with(["10.0.0.1", "10.0.0.2"])
+            mock_collect.assert_called_once()
+            self.assertEqual(mock_collect.call_args.args[0], ["10.0.0.1", "10.0.0.2"])
+            self.assertIn("min_mtime", mock_collect.call_args.kwargs)
             self.assertEqual(result.status, RunStatus.FAILED)
             self.assertIn("10.0.0.2", result.error_message)
             self.assertEqual(result.get_artifact("torch_traces"), combined_root)
@@ -679,6 +682,108 @@ class TestCollectMultiNodeTracesHeadOnly(unittest.TestCase):
 
             self.assertIsNone(second)
             self.assertFalse(stale_file.exists())
+
+    def test_shrunk_cluster_does_not_leave_previous_runs_higher_rank_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "artifacts" / "torch_profiler" / "rank_0").mkdir(parents=True)
+            (root / "artifacts" / "torch_profiler" / "rank_0" / "trace.json").write_text("{}")
+
+            runner = _make_runner(nodes=[socket.gethostname()], aorta_path=str(root))
+            # First run had 3 nodes; node_2 belongs to a node no longer in this run.
+            first = runner._collect_multi_node_traces([socket.gethostname(), "10.0.0.2", "10.0.0.3"])
+            self.assertIsNotNone(first)
+            self.assertTrue((root / "combined_traces" / "node_2").exists())
+
+            # This run only has one node -- the old node_2 must not survive, or a
+            # parser walking combined_traces would still see its stale rank data.
+            second = runner._collect_multi_node_traces([socket.gethostname()])
+            self.assertIsNotNone(second)
+            self.assertFalse((root / "combined_traces" / "node_2").exists())
+            self.assertFalse((root / "combined_traces" / "node_1").exists())
+            self.assertTrue((root / "combined_traces" / "node_0").exists())
+
+
+class TestCollectMultiNodeTracesSourceFreshness(unittest.TestCase):
+    """
+    ``min_mtime`` lets collection tell a previous run's leftover torch_profiler
+    output apart from this run's, even when the training config reuses the
+    same output_dir across runs (so the path alone can't tell them apart).
+    """
+
+    def test_source_tree_older_than_min_mtime_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trace_file = root / "artifacts" / "torch_profiler" / "rank_0" / "trace.json"
+            trace_file.parent.mkdir(parents=True)
+            trace_file.write_text("stale")
+            old_mtime = trace_file.stat().st_mtime - 3600
+            os.utime(trace_file, (old_mtime, old_mtime))
+
+            runner = _make_runner(nodes=[socket.gethostname()], aorta_path=str(root))
+            # This run "started" after the file above was written, so it must
+            # not be mistaken for this run's data.
+            result = runner._collect_multi_node_traces([socket.gethostname()], min_mtime=old_mtime + 1800)
+
+            self.assertIsNone(result)
+            self.assertFalse((root / "combined_traces" / "node_0" / "artifacts").exists())
+
+    def test_source_tree_newer_than_min_mtime_is_collected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trace_file = root / "artifacts" / "torch_profiler" / "rank_0" / "trace.json"
+            trace_file.parent.mkdir(parents=True)
+            trace_file.write_text("fresh")
+            run_start = trace_file.stat().st_mtime - 60
+
+            runner = _make_runner(nodes=[socket.gethostname()], aorta_path=str(root))
+            result = runner._collect_multi_node_traces([socket.gethostname()], min_mtime=run_start)
+
+            self.assertIsNotNone(result)
+            self.assertTrue(
+                (
+                    root / "combined_traces" / "node_0" / "artifacts" / "torch_profiler" / "rank_0" / "trace.json"
+                ).exists()
+            )
+
+    def test_no_min_mtime_collects_regardless_of_age(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trace_file = root / "artifacts" / "torch_profiler" / "rank_0" / "trace.json"
+            trace_file.parent.mkdir(parents=True)
+            trace_file.write_text("old but no floor given")
+            old_mtime = trace_file.stat().st_mtime - 3600
+            os.utime(trace_file, (old_mtime, old_mtime))
+
+            runner = _make_runner(nodes=[socket.gethostname()], aorta_path=str(root))
+            result = runner._collect_multi_node_traces([socket.gethostname()])
+
+            self.assertIsNotNone(result)
+
+
+class TestRunPassesTraceFreshnessFloor(unittest.TestCase):
+    def test_run_passes_min_mtime_derived_from_start_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = _make_runner(nodes=["10.0.0.1", "10.0.0.2"], aorta_path=Path(tmp))
+
+            def fake_run_single_node(*, node, node_rank, launch_cmd, env):
+                return (node, 0, "ok")
+
+            before = time.time()
+            with (
+                patch.object(r, "_run_single_node", side_effect=fake_run_single_node),
+                patch.object(r, "_pick_master_port", return_value=29500),
+                patch.object(r, "_collect_multi_node_traces", return_value=None) as mock_collect,
+            ):
+                r.run()
+            after = time.time()
+
+            min_mtime = mock_collect.call_args.kwargs["min_mtime"]
+            # Derived from run()'s own start_time (bracketed by before/after),
+            # offset by exactly the configured skew tolerance -- not some
+            # unrelated or hardcoded value.
+            self.assertGreaterEqual(min_mtime, before - r._TRACE_FRESHNESS_SKEW_SECONDS - 1)
+            self.assertLessEqual(min_mtime, after - r._TRACE_FRESHNESS_SKEW_SECONDS + 1)
 
 
 if __name__ == "__main__":

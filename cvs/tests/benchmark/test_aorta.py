@@ -284,12 +284,19 @@ class TestAortaBenchmark:
         run_result = TestAortaBenchmark.run_result
         trace_dir = run_result.get_artifact("torch_traces")
 
+        # Container TraceLens analysis only ever runs against the head node's own
+        # container and trace tree (see AortaRunner._resolve_analysis_output_dir),
+        # so its Excel reports cover only the head node's ranks. On a multi-node
+        # run that is incomplete, so the complete raw-trace parse below must stay
+        # authoritative; only a single-node run's reports cover the whole cluster.
+        is_multi_node = len(aorta_runner_config.nodes) > 1
+
         # Optional: try container-generated Excel reports first (if present and valid)
         analysis_dir = run_result.get_artifact("tracelens_analysis") or (
             trace_dir.parent / "tracelens_analysis" if trace_dir else None
         )
         has_valid_reports = False
-        if analysis_dir and analysis_dir.exists():
+        if not is_multi_node and analysis_dir and analysis_dir.exists():
             reports_dir = analysis_dir / "individual_reports"
             if reports_dir.exists():
                 report_files = list(reports_dir.glob("perf_rank*.xlsx")) or list(
