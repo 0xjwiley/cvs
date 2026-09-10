@@ -1237,11 +1237,10 @@ class AortaRunner(BaseRunner):
             # Search for torch_profiler directories in aorta_path (handles nested dirs like artifacts/*/torch_profiler).
             # Skip anything inside the combined_traces tree we just collected so the
             # original (older) per-node copies don't shadow the consolidated set.
-            combined_root = self.config.aorta_path / "combined_traces"
             for candidate in self.config.aorta_path.glob("**/torch_profiler"):
                 if not candidate.is_dir():
                     continue
-                if combined_traces_in(candidate, combined_root):
+                if combined_traces_in(candidate, self.config.aorta_path):
                     continue
                 try:
                     latest_file = max(

@@ -480,6 +480,31 @@ class TestRunPartialNodeFailureStillCollectsTraces(unittest.TestCase):
             self.assertIn("10.0.0.2", result.error_message)
             self.assertEqual(result.get_artifact("torch_traces"), combined_root)
 
+    def test_stale_combined_traces_copy_is_not_discovered_as_trace_dir(self):
+        # combined_traces_in must recognize paths nested under combined_traces
+        # (e.g. a leftover node_0/torch_profiler/ copy from a prior run in the
+        # same aorta_path, with this run's own collection disabled/empty) so
+        # the discovery loop never promotes it as trace_dir -- it's a partial,
+        # single-node view, not a fresh candidate.
+        with tempfile.TemporaryDirectory() as tmp:
+            aorta_path = Path(tmp)
+            stale_copy = aorta_path / "combined_traces" / "node_0" / "torch_profiler"
+            stale_copy.mkdir(parents=True)
+            (stale_copy / "trace.json").write_text("{}")
+            r = _make_runner(nodes=["10.0.0.1", "10.0.0.2"], aorta_path=aorta_path)
+            r.config.multi_node.collect_traces = False
+
+            def fake_run_single_node(*, node, node_rank, launch_cmd, env):
+                return (node, 0, "ok")
+
+            with (
+                patch.object(r, "_run_single_node", side_effect=fake_run_single_node),
+                patch.object(r, "_pick_master_port", return_value=29500),
+            ):
+                result = r.run()
+
+            self.assertIsNone(result.get_artifact("torch_traces"))
+
 
 class TestCombinedTracesIn(unittest.TestCase):
     def test_returns_true_when_under_combined_traces(self):
