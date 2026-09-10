@@ -1,5 +1,6 @@
 '''Shared vLLM lifecycle tests for the explicit single and distributed suites.'''
 
+import json
 import pathlib
 import shlex
 import time
@@ -9,7 +10,13 @@ import pytest
 from cvs.lib import globals
 from cvs.lib.inference.utils.inference_suite_lifecycle import test_accuracy_eval  # noqa: F401
 from cvs.lib.inference.utils.vllm_config_loader import load_variant
-from cvs.lib.inference.utils.vllm_parsing import VLLM_RESULTS_COLUMNS
+from cvs.lib.inference.utils.vllm_metrics import (
+    METRIC_REGISTRY,
+    VLLM_RESULTS_COLUMNS,
+    is_finite_number,
+    merge_metric_sources,
+    metric_contract,
+)
 from cvs.lib.inference.utils.vllm_server_metrics import to_prom_metrics
 from cvs.lib.inference.utils.vllm_verification import evaluate_metric_verdicts
 from cvs.lib.inference.vllm_job import VllmJob, scrape_vllm_metrics
@@ -30,6 +37,7 @@ _FETCH_POLL_WAIT_S = 30
 _SMOKE_ISL = 128
 _SMOKE_OSL = 32
 _SMOKE_MAX_MODEL_LEN = 512
+VLLM_JUNIT_PROPERTY = "cvs_vllm_metrics_v1"
 
 
 def pytest_generate_tests(metafunc):
@@ -134,6 +142,59 @@ def _gpu_snap(orch):
         return {}
 
 
+def _clear_live_server(lifecycle):
+    lifecycle.live_server_sig = None
+    lifecycle.live_server_job = None
+    lifecycle.model_load_s = None
+    lifecycle.model_load_memory_mb = None
+
+
+def _live_server_measurements(lifecycle, signature):
+    if getattr(lifecycle, "live_server_sig", None) != signature:
+        return None
+    if getattr(lifecycle, "live_server_job", None) is None:
+        return None
+    return (
+        getattr(lifecycle, "model_load_s", None),
+        getattr(lifecycle, "model_load_memory_mb", None),
+    )
+
+
+def _load_measurements(before, after, elapsed):
+    before_vram = before.get("gpu.used_vram")
+    after_vram = after.get("gpu.used_vram")
+    load_s = elapsed if is_finite_number(elapsed) else None
+    load_mb = after_vram - before_vram if is_finite_number(before_vram) and is_finite_number(after_vram) else None
+    return load_s, load_mb
+
+
+def _finite_or_none(value):
+    return value if is_finite_number(value) else None
+
+
+def _record_junit_metrics(node, actuals_by_host):
+    actuals = {}
+    for host in sorted(actuals_by_host, key=str):
+        host_actuals = actuals_by_host[host]
+        actuals[str(host)] = {
+            definition.name: _finite_or_none(host_actuals[definition.name])
+            for definition in METRIC_REGISTRY
+            if definition.name in host_actuals
+        }
+    payload = json.dumps(
+        {
+            "actuals_by_host": actuals,
+            "metric_contract": metric_contract(),
+        },
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    properties = [(key, value) for key, value in getattr(node, "user_properties", []) if key != VLLM_JUNIT_PROPERTY]
+    properties.append((VLLM_JUNIT_PROPERTY, payload))
+    node.user_properties = properties
+
+
 def test_openai_compatible_smoke(orch, variant_config, hf_token, vllm_targets, lifecycle, request):
     if lifecycle.failed:
         pytest.skip("a prior lifecycle stage failed")
@@ -170,37 +231,43 @@ def test_vllm_inference(orch, variant_config, hf_token, vllm_targets, run, inf_r
         pytest.skip("a prior lifecycle stage failed")
     isl = run.cell.isl
     osl = run.cell.osl
-    job = VllmJob(
-        orch=orch,
-        variant=variant_config,
-        hf_token=hf_token,
-        isl=isl,
-        osl=osl,
-        concurrency=run.cell.concurrency,
-        num_prompts=run.benchmark_params["num_prompts"],
-        benchmark_params=run.benchmark_params,
-        ib_hcas=getattr(lifecycle, "ib_hcas", []),
-    )
+    job = None
     load_s = None
     load_mb = None
     poll_readings = []
     try:
+        job = VllmJob(
+            orch=orch,
+            variant=variant_config,
+            hf_token=hf_token,
+            isl=isl,
+            osl=osl,
+            concurrency=run.cell.concurrency,
+            num_prompts=run.benchmark_params["num_prompts"],
+            benchmark_params=run.benchmark_params,
+            ib_hcas=getattr(lifecycle, "ib_hcas", []),
+        )
         signature = job.server_signature()
-        if getattr(lifecycle, "live_server_sig", None) == signature:
+        measurements = _live_server_measurements(lifecycle, signature)
+        if measurements is not None:
+            load_s, load_mb = measurements
             lifecycle.record(request.node.nodeid, "server_ready", 0.0)
         else:
+            _clear_live_server(lifecycle)
             job.stop_server()
             job.build_server_cmd()
-            lifecycle.live_server_job = job
             before = _gpu_snap(orch)
             started = time.monotonic()
             job.start_server()
             job.wait_ready()
-            load_s = time.monotonic() - started
-            lifecycle.record(request.node.nodeid, "server_ready", load_s)
-            lifecycle.live_server_sig = signature
+            elapsed = time.monotonic() - started
+            lifecycle.record(request.node.nodeid, "server_ready", elapsed)
             after = _gpu_snap(orch)
-            load_mb = ((after.get("gpu.used_vram") or 0) - (before.get("gpu.used_vram") or 0)) or None
+            load_s, load_mb = _load_measurements(before, after, elapsed)
+            lifecycle.live_server_sig = signature
+            lifecycle.live_server_job = job
+            lifecycle.model_load_s = load_s
+            lifecycle.model_load_memory_mb = load_mb
 
         html_path = getattr(request.config.option, "htmlpath", None)
         html_dir = getattr(request.config, "_test_html_dir", "test_html")
@@ -228,25 +295,27 @@ def test_vllm_inference(orch, variant_config, hf_token, vllm_targets, run, inf_r
             )
         after_prom = scrape_vllm_metrics(orch, job.base_url, job.port_no)
         results = job.parse_results()
+
+        aggregate = agg_readings(poll_readings)
+        gpu_results = {
+            "peak_gpu_memory_mb": _finite_or_none(aggregate.get("peak_gpu_memory_mb")),
+            "model_load_memory_mb": load_mb,
+            "model_load_s": load_s,
+            "gpu_bandwidth_util_pct": _finite_or_none(aggregate.get("gpu_bandwidth_util_pct")),
+            "gpu_compute_util_pct": _finite_or_none(aggregate.get("gpu_compute_util_pct")),
+        }
+        prom_results = to_prom_metrics(before_prom, after_prom)
+        published_results = {
+            host: merge_metric_sources(actuals, gpu_results, prom_results) for host, actuals in results.items()
+        }
+        inf_res_dict[_cell_result_key(variant_config, run)] = published_results
     except Exception:
         lifecycle.failed = True
-        lifecycle.live_server_sig = None
-        getattr(lifecycle, "live_server_job", job).dump_server_log()
+        dump_job = getattr(lifecycle, "live_server_job", None) or job
+        _clear_live_server(lifecycle)
+        if dump_job is not None:
+            dump_job.dump_server_log()
         raise
-
-    aggregate = agg_readings(poll_readings)
-    gpu_results = {
-        "gpu.peak_gpu_memory_mb": aggregate.get("peak_gpu_memory_mb"),
-        "gpu.model_load_memory_mb": load_mb,
-        "gpu.model_load_s": load_s,
-        "gpu.gpu_bandwidth_util_pct": aggregate.get("gpu_bandwidth_util_pct"),
-        "gpu.gpu_compute_util_pct": aggregate.get("gpu_compute_util_pct"),
-    }
-    prom_results = to_prom_metrics(before_prom, after_prom)
-    for actuals in results.values():
-        actuals.update(gpu_results)
-        actuals.update(prom_results)
-    inf_res_dict[_cell_result_key(variant_config, run)] = results
 
 
 def test_verify_cell_metrics(run, inf_res_dict, variant_config, lifecycle, request, subtests):
@@ -265,18 +334,15 @@ def test_verify_cell_metrics(run, inf_res_dict, variant_config, lifecycle, reque
         pytest.skip(f"no configured metric specs for {run.cell.key}")
 
     record_benchmark_metric_rows(request.node, verdicts, columns=VLLM_RESULTS_COLUMNS)
+    _record_junit_metrics(request.node, host_dict)
     asserted_verdicts = [verdict for verdict in verdicts if verdict["enforced"]]
     started = time.monotonic()
     for verdict in asserted_verdicts:
         with subtests.test(node=verdict["node"], metric=verdict["metric"]):
-            if verdict["status"] == "skip":
-                pytest.skip(verdict["reason"])
             assert verdict["status"] == "pass", verdict["reason"]
     lifecycle.record(request.node.nodeid, "metric_verification", time.monotonic() - started)
     if not asserted_verdicts:
         pytest.skip(f"metrics recorded without active threshold gates for {run.cell.key}")
-    if all(verdict["status"] == "skip" for verdict in asserted_verdicts):
-        pytest.skip(f"all active metrics were unavailable for {run.cell.key}")
 
 
 def test_teardown(orch, lifecycle, request):

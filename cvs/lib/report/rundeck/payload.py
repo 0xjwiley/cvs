@@ -108,6 +108,9 @@ class RundeckPayloadBuilder:
             "datasets": datasets,
             "deck_profile": self.profile_dict or {"cards": default_deck_cards()},
         }
+        metric_contract = self.config.metric_contract
+        if metric_contract is not None:
+            payload["metric_contract"] = dict(metric_contract)
 
         if isinstance(self.profile, dict) and self.profile.get("cards"):
             payload["deck_profile"] = self.profile

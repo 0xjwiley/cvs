@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from cvs.lib.report import benchmark_metric_registry as registry
 from cvs.lib.report.render.perf_metric_table import is_benchmark_metrics_extra
@@ -26,16 +27,48 @@ class TestVllmMetricReportHook(unittest.TestCase):
         registry._ROWS_BY_NODEID.clear()
         registry._COLUMNS_BY_NODEID.clear()
 
+    def test_lifecycle_starts_without_live_server_state(self):
+        lifecycle = vllm_conftest._Lifecycle()
+
+        self.assertIsNone(lifecycle.live_server_sig)
+        self.assertIsNone(lifecycle.live_server_job)
+        self.assertIsNone(lifecycle.model_load_s)
+        self.assertIsNone(lifecycle.model_load_memory_mb)
+
+    def test_collection_order_keeps_teardown_last(self):
+        names = [
+            "test_teardown",
+            "test_accuracy_eval",
+            "test_verify_cell_metrics",
+            "test_vllm_inference",
+            "test_launch_container",
+        ]
+        items = [SimpleNamespace(originalname=name, name=name) for name in names]
+
+        with mock.patch.object(vllm_conftest, "validate_vllm_execution_mode"):
+            vllm_conftest.pytest_collection_modifyitems(SimpleNamespace(), items)
+
+        self.assertEqual(
+            [item.originalname for item in items],
+            [
+                "test_launch_container",
+                "test_vllm_inference",
+                "test_verify_cell_metrics",
+                "test_accuracy_eval",
+                "test_teardown",
+            ],
+        )
+
     def test_makereport_attaches_and_stamps_metric_panel(self):
         nodeid = 'cvs/tests/inference/vllm/vllm_single.py::test_verify_cell_metrics[cell]'
         item = SimpleNamespace(nodeid=nodeid, stash=_FakeStash())
         rows = [
             {
                 'node': 'head',
-                'metric': 'client.output_throughput',
+                'metric': 'output_throughput',
                 'status': 'record',
                 'actual': 99,
-                'spec': {'kind': 'min_tok_s', 'value': 100},
+                'spec': {'kind': 'min', 'value': 100},
                 'enforced': False,
             }
         ]

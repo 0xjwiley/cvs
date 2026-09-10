@@ -103,23 +103,38 @@ without validating both registration and call sites in the exact image.
 
 ## Thresholds
 
-`enforce_thresholds` is **false** on every config, so nothing gates and metrics
-are only recorded. Each threshold file carries a placeholder for every metric
-the suite can gate on — 32 per file. That full grid is a convenience for later
-calibration, **not** a loader requirement: the vLLM loader checks cell coverage
-only, and an absent metric spec means "don't gate this metric". A threshold file
-may gate just the handful of metrics you care about.
+`enforce_thresholds` is **false** on every config, so nothing gates. vLLM
+supports 56 registry metrics and reports every finite value it produces. Each
+packaged threshold cell intentionally retains the previous 32-metric assertion
+subset: 23 client/run metrics, all 5 GPU metrics, and all 4 Prometheus metrics.
+That subset is a packaging choice, **not** a loader requirement: users may add
+any other registered metric or remove any existing entry, and only retained
+entries gate when enforcement is enabled.
 
-| Family | Count | Source of the list |
-|---|---|---|
-| `client.*` | 23 | the suite's gated-metric set |
-| `gpu.*` | 5 | `cvs.lib.utils.gpu.GPU_METRICS` |
-| `prom.*` | 4 | `vllm_server_metrics.PROM_METRICS` |
+| Family | Packaged subset | Registry total | Source of the list |
+|---|---:|---:|---|
+| Client/run | 23 | 47 | `vllm_metrics.METRIC_REGISTRY` |
+| GPU | 5 | 5 | Registry definitions composed from `GPU_METRICS` |
+| Prometheus | 4 | 4 | `vllm_metrics.METRIC_REGISTRY` |
 
 **Every value is `0`**, meaning *not yet measured* — not a real bound. On a
-`max`/`max_ms` kind, `0` is an impossible bound, so enabling enforcement before
+`max` kind, `0` is an impossible bound, so enabling enforcement before
 calibrating fails loudly rather than passing silently. Replace them with
 measured values from a calibration run before flipping `enforce_thresholds`.
+
+Metric names are bare, for example:
+
+```json
+"output_throughput": {"kind": "min", "value": 4000},
+"mean_ttft_ms": {"kind": "max", "value": 500}
+```
+
+Every spec must contain exactly `kind` and `value`. `kind` is fixed by the
+registry (`min` or `max`), and `value` must be a finite JSON number. Prefixed
+names such as `client.output_throughput`, legacy kinds such as `min_tok_s` and
+`max_ms`, and extra fields are rejected at load time even when enforcement is
+disabled. Reports use metric contract `vllm-bare` version 1; older namespaced
+Run Deck JSON files are intentionally incompatible as comparison baselines.
 
 ### Accuracy
 
@@ -131,7 +146,7 @@ Accuracy is split across the two files, unlike the three families above:
   then by lm-eval metric key. Add it when configuring accuracy tasks.
 
 Because the threshold keys are derived from the task ids you choose, they
-cannot be pre-enumerated the way `client.*`/`gpu.*`/`prom.*` can — the two
+cannot be pre-enumerated the way sweep metrics can — the two
 blocks must be filled in together:
 
 ```jsonc
